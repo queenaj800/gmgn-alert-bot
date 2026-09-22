@@ -23,6 +23,16 @@ const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 // dan token itu dilewati di siklus itu — bukan diproses dengan asumsi harga tetap benar.
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
 
+// Lapisan proteksi kedua: token dengan market cap di bawah ini diabaikan TOTAL,
+// tidak peduli harga/likuiditas pool-nya seperti apa. Ini menyaring koin yang
+// sudah benar-benar mati/rugpull walau ada anomali baca harga dari pool tertentu.
+// Set ke 0 untuk menonaktifkan filter ini.
+const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
+
+// Kalau harga melompat lebih dari sekian kali lipat dibanding pembacaan sebelumnya
+// dalam satu siklus cek, itu dianggap data tidak akurat (bukan pergerakan harga nyata)
+const MAX_PRICE_JUMP_RATIO = parseFloat(process.env.MAX_PRICE_JUMP_RATIO || '100');
+
 // Dua interval terpisah:
 // - DISCOVER: refresh daftar koin trending dari Birdeye (mahal secara compute unit, jadi jarang)
 // - CHECK: cek harga & volume koin yang ada di watchlist lewat DexScreener (gratis, jadi bisa sering)
@@ -32,6 +42,8 @@ const TOP_N = parseInt(process.env.TOP_N || '20', 10); // maksimal 20 (batas end
 // STATE_DIR bisa diarahkan ke path Railway Volume supaya riwayat harga tidak hilang saat redeploy
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
+
+console.log('gmgn-alert-bot — versi 2026-09-22-v3 (liquidity gate + marketcap gate aktif)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -130,17 +142,7 @@ async function refreshWatchlist() {
 }
 
 // ==================== DEXSCREENER: harga, volume, marketcap, likuiditas ====================
-async function getTokenMarketData(address) {
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const json = await res.json();
-  const pairs = (json?.pairs || []).filter((p) => p.chainId === 'solana');
-  if (pairs.length === 0) return null;
-
-  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-  const p = pairs[0];
-
+function buildMarketData(p) {
   // Aturan validasi: kalau harga tidak tersedia/valid, jangan diasumsikan 0 — anggap data tidak ada
   const priceNum = parseFloat(p.priceUsd);
   if (!p.priceUsd || Number.isNaN(priceNum)) return null;
@@ -148,11 +150,11 @@ async function getTokenMarketData(address) {
   const liquidityUsd = p.liquidity?.usd ?? null;
 
   // Likuiditas terlalu tipis = harga rawan palsu/outlier (pool nyaris kosong bisa melompat liar).
-  // Daripada dipakai dan mencemari riwayat harga puncak, token ini dilewati dulu di siklus ini.
   if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
 
   return {
-    address,
+    address: p.baseToken?.address,
+    pairAddress: p.pairAddress,
     symbol: p.baseToken?.symbol || '?',
     name: p.baseToken?.name || '?',
     price: priceNum, // selalu harga USD (priceUsd), tidak dicampur dengan harga native
@@ -161,6 +163,33 @@ async function getTokenMarketData(address) {
     liquidityUsd,
     pairUrl: p.url,
   };
+}
+
+// Ambil data dari SATU pair spesifik yang sudah dipatok sebelumnya (stabil, tidak berubah-ubah)
+async function getPairData(pairAddress) {
+  const url = `https://api.dexscreener.com/latest/dex/pairs/solana/${pairAddress}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const json = await res.json();
+  const p = json?.pair || (json?.pairs && json.pairs[0]);
+  if (!p) return null;
+  return buildMarketData(p);
+}
+
+// Cari & pilih pair paling relevan untuk sebuah token (dipakai saat belum ada pair yang dipatok,
+// atau saat pair yang dipatok sebelumnya sudah tidak ada lagi). Dipilih berdasarkan VOLUME 24 JAM
+// tertinggi (bukan cuma likuiditas) supaya konsisten memilih pool yang benar-benar aktif
+// diperdagangkan sekarang — bukan pool lama yang sudah ditinggalkan tapi likuiditasnya masih tercatat.
+async function discoverPair(address) {
+  const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const json = await res.json();
+  const pairs = (json?.pairs || []).filter((p) => p.chainId === 'solana');
+  if (pairs.length === 0) return null;
+
+  pairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
+  return buildMarketData(pairs[0]);
 }
 
 // ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit) ====================
