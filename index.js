@@ -29,15 +29,15 @@ const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000')
 // Dua interval terpisah:
 // - DISCOVER: refresh daftar koin trending dari Birdeye (mahal secara compute unit, jadi jarang)
 // - CHECK: cek harga & volume koin yang ada di watchlist lewat DexScreener (gratis, jadi bisa sering)
-const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '60', 10) * 60 * 1000;
+const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
-const TOP_N = parseInt(process.env.TOP_N || '20', 10); // maksimal 20 (batas endpoint trending Birdeye)
+const TOP_N = parseInt(process.env.TOP_N || '50', 10); // maksimal 50 (batas endpoint /defi/tokenlist Birdeye)
 
 // STATE_DIR bisa diarahkan ke path Railway Volume supaya riwayat harga tidak hilang saat redeploy
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-22-v4 (liquidity gate + marketcap gate aktif)');
+console.log('gmgn-alert-bot — versi 2026-09-22-v5 (discovery diperluas ke 50 koin via /defi/tokenlist)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -105,10 +105,16 @@ function sleep(ms) {
 }
 
 // ==================== BIRDEYE: tahap "temukan" (jarang, hemat compute unit) ====================
+// Catatan jujur: Birdeye & DexScreener sama-sama TIDAK punya endpoint gratis yang
+// diurutkan by volume 1 JAM — cuma tersedia volume 24 jam. /defi/tokenlist dipakai
+// di sini karena lebih murah (30 CU vs 50 CU di /defi/token_trending) dan bisa ambil
+// 50 koin sekaligus (vs 20), jadi cakupannya jauh lebih luas walau urutannya tetap
+// berdasar volume 24 jam. Volume 1 jam yang presisi tetap diambil per-koin dari
+// DexScreener di checkPricesOnce() untuk menentukan sinyal yang sebenarnya.
 async function refreshWatchlist() {
   console.log(`\n[${new Date().toISOString()}] Refresh daftar koin trending dari Birdeye...`);
   try {
-    const url = `https://public-api.birdeye.so/defi/token_trending?sort_by=volume24hUSD&sort_type=desc&offset=0&limit=${TOP_N}`;
+    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${TOP_N}`;
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
