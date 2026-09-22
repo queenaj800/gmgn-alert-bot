@@ -15,23 +15,16 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');   // PUMP_THRESHOLD
 const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THRESHOLD
 
-// Ambang likuiditas (USD) — di bawah ini, notifikasi diberi label risiko
+// Di bawah likuiditas ini (USD), notifikasi diberi label risiko (tapi tetap dikirim)
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 
-// Ambang likuiditas MINIMUM supaya harga dianggap valid untuk dipakai sama sekali.
-// Di bawah ini, harga dianggap tidak bisa dipercaya (rawan angka palsu dari pool nyaris kosong)
-// dan token itu dilewati di siklus itu — bukan diproses dengan asumsi harga tetap benar.
+// Di bawah likuiditas ini (USD), harga dianggap TIDAK BISA DIPERCAYA sama sekali
+// (rawan angka palsu dari pool nyaris kosong) — token dilewati total, tidak diproses.
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
 
-// Lapisan proteksi kedua: token dengan market cap di bawah ini diabaikan TOTAL,
-// tidak peduli harga/likuiditas pool-nya seperti apa. Ini menyaring koin yang
-// sudah benar-benar mati/rugpull walau ada anomali baca harga dari pool tertentu.
-// Set ke 0 untuk menonaktifkan filter ini.
+// Di bawah market cap ini (USD), token diabaikan TOTAL — dianggap sudah mati/rugpull,
+// terlepas dari berapa pun harga/likuiditas pool-nya. Set ke 0 untuk menonaktifkan.
 const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
-
-// Kalau harga melompat lebih dari sekian kali lipat dibanding pembacaan sebelumnya
-// dalam satu siklus cek, itu dianggap data tidak akurat (bukan pergerakan harga nyata)
-const MAX_PRICE_JUMP_RATIO = parseFloat(process.env.MAX_PRICE_JUMP_RATIO || '100');
 
 // Dua interval terpisah:
 // - DISCOVER: refresh daftar koin trending dari Birdeye (mahal secara compute unit, jadi jarang)
@@ -39,11 +32,12 @@ const MAX_PRICE_JUMP_RATIO = parseFloat(process.env.MAX_PRICE_JUMP_RATIO || '100
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '60', 10) * 60 * 1000;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
 const TOP_N = parseInt(process.env.TOP_N || '20', 10); // maksimal 20 (batas endpoint trending Birdeye)
+
 // STATE_DIR bisa diarahkan ke path Railway Volume supaya riwayat harga tidak hilang saat redeploy
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-22-v3 (liquidity gate + marketcap gate aktif)');
+console.log('gmgn-alert-bot — versi 2026-09-22-v4 (liquidity gate + marketcap gate aktif)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -73,7 +67,6 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
     ? `$${Number(marketCap).toLocaleString('en-US')}`
     : 'Data tidak tersedia';
 
-  // Sesuai aturan validasi: kalau likuiditas tidak diketahui atau di bawah ambang, jangan asumsikan aman
   const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
   const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
 
@@ -127,7 +120,6 @@ async function refreshWatchlist() {
     const json = await res.json();
     const addresses = (json?.data?.tokens || []).map((t) => t.address).filter(Boolean);
 
-    // watchlist baru, tapi tetap bawa riwayat harga puncak koin yang masih ada di daftar
     const newPrices = {};
     for (const addr of addresses) {
       newPrices[addr] = state.prices[addr] || { maxPrice: 0 };
@@ -142,45 +134,7 @@ async function refreshWatchlist() {
 }
 
 // ==================== DEXSCREENER: harga, volume, marketcap, likuiditas ====================
-function buildMarketData(p) {
-  // Aturan validasi: kalau harga tidak tersedia/valid, jangan diasumsikan 0 — anggap data tidak ada
-  const priceNum = parseFloat(p.priceUsd);
-  if (!p.priceUsd || Number.isNaN(priceNum)) return null;
-
-  const liquidityUsd = p.liquidity?.usd ?? null;
-
-  // Likuiditas terlalu tipis = harga rawan palsu/outlier (pool nyaris kosong bisa melompat liar).
-  if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
-
-  return {
-    address: p.baseToken?.address,
-    pairAddress: p.pairAddress,
-    symbol: p.baseToken?.symbol || '?',
-    name: p.baseToken?.name || '?',
-    price: priceNum, // selalu harga USD (priceUsd), tidak dicampur dengan harga native
-    volume1h: p.volume?.h1 || 0,
-    marketCap: p.marketCap ?? p.fdv ?? null, // null kalau memang tidak tersedia, bukan diasumsikan 0
-    liquidityUsd,
-    pairUrl: p.url,
-  };
-}
-
-// Ambil data dari SATU pair spesifik yang sudah dipatok sebelumnya (stabil, tidak berubah-ubah)
-async function getPairData(pairAddress) {
-  const url = `https://api.dexscreener.com/latest/dex/pairs/solana/${pairAddress}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const json = await res.json();
-  const p = json?.pair || (json?.pairs && json.pairs[0]);
-  if (!p) return null;
-  return buildMarketData(p);
-}
-
-// Cari & pilih pair paling relevan untuk sebuah token (dipakai saat belum ada pair yang dipatok,
-// atau saat pair yang dipatok sebelumnya sudah tidak ada lagi). Dipilih berdasarkan VOLUME 24 JAM
-// tertinggi (bukan cuma likuiditas) supaya konsisten memilih pool yang benar-benar aktif
-// diperdagangkan sekarang — bukan pool lama yang sudah ditinggalkan tapi likuiditasnya masih tercatat.
-async function discoverPair(address) {
+async function getTokenMarketData(address) {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
   const res = await fetch(url);
   if (!res.ok) return null;
@@ -188,8 +142,33 @@ async function discoverPair(address) {
   const pairs = (json?.pairs || []).filter((p) => p.chainId === 'solana');
   if (pairs.length === 0) return null;
 
-  pairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
-  return buildMarketData(pairs[0]);
+  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  const p = pairs[0];
+
+  // Aturan validasi: kalau harga tidak tersedia/valid, jangan diasumsikan 0 — anggap data tidak ada
+  const priceNum = parseFloat(p.priceUsd);
+  if (!p.priceUsd || Number.isNaN(priceNum)) return null;
+
+  const liquidityUsd = p.liquidity?.usd ?? null;
+
+  // Likuiditas terlalu tipis = harga rawan palsu/outlier (pool nyaris kosong bisa melompat liar)
+  if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
+
+  const marketCap = p.marketCap ?? p.fdv ?? null;
+
+  // Market cap terlalu kecil (atau tidak diketahui) = koin sudah mati/rugpull, bukan target valid
+  if (MIN_MARKET_CAP_USD > 0 && (marketCap == null || marketCap < MIN_MARKET_CAP_USD)) return null;
+
+  return {
+    address,
+    symbol: p.baseToken?.symbol || '?',
+    name: p.baseToken?.name || '?',
+    price: priceNum,
+    volume1h: p.volume?.h1 || 0,
+    marketCap,
+    liquidityUsd,
+    pairUrl: p.url,
+  };
 }
 
 // ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit) ====================
@@ -208,23 +187,22 @@ async function checkPricesOnce() {
       console.error(`Gagal ambil data ${addr}:`, err.message);
       continue;
     }
-    if (!data) continue; // data tidak lengkap/valid — dilewati, tidak diasumsikan
+    if (!data) continue;
 
     const entry = state.prices[addr] || { maxPrice: 0 };
     if (data.price > entry.maxPrice) entry.maxPrice = data.price;
 
-    // Definisi siklus: sudah pernah >= PUMP_THRESHOLD (PRICE_HIGH), sekarang <= DUMP_THRESHOLD (PRICE_LOW)
     const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
     const sudahTurun = data.price <= PRICE_LOW;
 
     if (sudahMelambung && sudahTurun) {
       console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price}`);
       await sendTelegramAlert(data);
-      entry.maxPrice = data.price; // reset — siklus baru butuh harga naik ke atas PRICE_HIGH lagi
+      entry.maxPrice = data.price;
     }
 
     state.prices[addr] = entry;
-    await sleep(150); // jaga-jaga rate limit DexScreener
+    await sleep(150);
   }
 
   saveState(state);
@@ -238,8 +216,8 @@ http.createServer((req, res) => res.end('Bot aktif ✅')).listen(PORT, () => {
 
 // ==================== JALANKAN ====================
 (async () => {
-  await refreshWatchlist(); // isi watchlist pertama kali
-  await checkPricesOnce();  // langsung cek begitu watchlist terisi
+  await refreshWatchlist();
+  await checkPricesOnce();
 
   setInterval(refreshWatchlist, DISCOVER_INTERVAL_MS);
   setInterval(checkPricesOnce, CHECK_INTERVAL_MS);
