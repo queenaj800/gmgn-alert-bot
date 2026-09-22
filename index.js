@@ -18,13 +18,20 @@ const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THR
 // Ambang likuiditas (USD) — di bawah ini, notifikasi diberi label risiko
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 
+// Ambang likuiditas MINIMUM supaya harga dianggap valid untuk dipakai sama sekali.
+// Di bawah ini, harga dianggap tidak bisa dipercaya (rawan angka palsu dari pool nyaris kosong)
+// dan token itu dilewati di siklus itu — bukan diproses dengan asumsi harga tetap benar.
+const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
+
 // Dua interval terpisah:
 // - DISCOVER: refresh daftar koin trending dari Birdeye (mahal secara compute unit, jadi jarang)
 // - CHECK: cek harga & volume koin yang ada di watchlist lewat DexScreener (gratis, jadi bisa sering)
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '60', 10) * 60 * 1000;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
 const TOP_N = parseInt(process.env.TOP_N || '20', 10); // maksimal 20 (batas endpoint trending Birdeye)
-const STATE_FILE = path.join(__dirname, 'state.json');
+// STATE_DIR bisa diarahkan ke path Railway Volume supaya riwayat harga tidak hilang saat redeploy
+const STATE_DIR = process.env.STATE_DIR || __dirname;
+const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -138,6 +145,12 @@ async function getTokenMarketData(address) {
   const priceNum = parseFloat(p.priceUsd);
   if (!p.priceUsd || Number.isNaN(priceNum)) return null;
 
+  const liquidityUsd = p.liquidity?.usd ?? null;
+
+  // Likuiditas terlalu tipis = harga rawan palsu/outlier (pool nyaris kosong bisa melompat liar).
+  // Daripada dipakai dan mencemari riwayat harga puncak, token ini dilewati dulu di siklus ini.
+  if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
+
   return {
     address,
     symbol: p.baseToken?.symbol || '?',
@@ -145,7 +158,7 @@ async function getTokenMarketData(address) {
     price: priceNum, // selalu harga USD (priceUsd), tidak dicampur dengan harga native
     volume1h: p.volume?.h1 || 0,
     marketCap: p.marketCap ?? p.fdv ?? null, // null kalau memang tidak tersedia, bukan diasumsikan 0
-    liquidityUsd: p.liquidity?.usd ?? null,
+    liquidityUsd,
     pairUrl: p.url,
   };
 }

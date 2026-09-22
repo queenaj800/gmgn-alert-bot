@@ -54,6 +54,29 @@ Nama token, CA, harga sekarang, volume 1 jam, market cap, link chart, dan
   tingkat lanjut) untuk itu. Beri tahu saya kalau ini penting, supaya bisa
   dicarikan opsi sumber data lain.
 
+## Kenapa sempat muncul sinyal palsu (sudah diperbaiki)
+
+Kalau `state.json` hilang (misalnya karena redeploy — lihat bagian Railway
+Volume di bawah), bot "melupakan" riwayat harga koin. Saat koin itu dibaca
+ulang dari nol, kadang DexScreener sempat mengembalikan harga dari **pool
+yang likuiditasnya nyaris kosong**, yang harganya bisa melompat liar dan
+tidak mencerminkan harga wajar. Sekarang bot **menolak memakai harga dari
+pool dengan likuiditas di bawah `MIN_LIQUIDITY_FOR_SIGNAL_USD`** (default
+$2.000) — token itu dilewati di siklus tersebut, bukan diproses dengan
+angka yang meragukan.
+
+## Setup Railway Volume (mencegah riwayat harga hilang)
+
+Tanpa ini, `state.json` bisa ter-reset tiap kali kamu redeploy (upload
+ulang kode), yang bisa memicu pembacaan awal yang salah seperti di atas.
+
+1. Di Railway, buka service `gmgn-alert-bot` → tab **Settings** → cari
+   bagian **Volumes**
+2. Tap **"+ New Volume"**, isi mount path misalnya `/data`
+3. Buka tab **Variables**, tambahkan `STATE_DIR` = `/data`
+4. Railway redeploy otomatis — sejak itu `state.json` disimpan permanen di
+   volume tersebut, tidak hilang lagi walau kamu upload kode baru
+
 ## Kenapa satu koin bisa muncul berkali-kali
 
 Kalau sebuah koin sudah "mati" (harga sangat rendah, likuiditas tipis) tapi
