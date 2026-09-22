@@ -1,31 +1,67 @@
 # GMGN Alert Bot
 
 Bot Telegram yang memantau koin trending di Solana (mirip menu "temukan" GMGN,
-diurutkan volume tinggi ke rendah), lalu mengirim notifikasi saat sebuah koin
-**pernah menyentuh harga ≥ $0.0001** kemudian **turun ke ≤ $0.00003**.
+diurutkan volume tinggi ke rendah), lalu mengirim notifikasi saat sebuah token
+mengalami satu siklus **pump lalu dump**.
+
+## Definisi siklus
+
+- **PUMP_THRESHOLD** (`PRICE_HIGH`, default `0.0001`): siklus dimulai saat
+  harga token pertama kali mencapai atau melewati nilai ini.
+- **DUMP_THRESHOLD** (`PRICE_LOW`, default `0.00005`): siklus berakhir —
+  notifikasi terkirim — saat harga kemudian turun mencapai atau melewati
+  nilai ini.
+- Setelah notifikasi terkirim, siklus untuk token itu di-reset. Token perlu
+  naik ke atas `PRICE_HIGH` lagi sebelum siklus baru bisa aktif dan memicu
+  notifikasi berikutnya.
+- Target token: baik token yang relatif baru, maupun koin lama berharga
+  rendah yang tiba-tiba pump ke atas `PRICE_HIGH` — tidak dibedakan, karena
+  keduanya sama-sama valid selama pola harga cocok.
 
 ## Cara kerja (dua kecepatan berbeda)
 
-Bot ini sengaja dipisah jadi dua siklus, karena `token_trending` di Birdeye
-memakan **40 compute unit per panggilan**, sementara jatah gratis cuma
-30.000 CU/bulan (~750 panggilan/bulan, setara sekali per jam). Kalau dipaksa
-polling cepat lewat Birdeye saja, jatah gratis akan habis jauh sebelum
-sebulan.
+Bot ini sengaja dipisah jadi dua siklus polling, karena `token_trending` di
+Birdeye memakan **40 compute unit per panggilan**, sementara jatah gratis
+cuma 30.000 CU/bulan (~750 panggilan/bulan, setara sekali per jam).
 
-1. **Refresh watchlist** (default: **tiap 1 jam**) — bot minta daftar token
+1. **Refresh watchlist** (default: tiap **1 jam**) — bot minta daftar token
    Solana trending dari **Birdeye API**, diurutkan volume 24 jam. Ini yang
    menggantikan tahap "temukan" di GMGN.
-2. **Cek harga** (default: **tiap 1 menit**) — untuk tiap koin di watchlist,
-   bot ambil harga & volume 1 jam yang akurat dari **DexScreener API**
-   (gratis, tanpa API key, tanpa batas compute unit). Karena bagian ini yang
-   paling menentukan buat menangkap momentum naik-turun cepat, dia dibuat
-   jauh lebih sering daripada refresh watchlist-nya.
-3. Bot menyimpan harga tertinggi yang pernah tercatat untuk tiap koin (di
-   `state.json`). Kalau harga tertinggi itu ≥ 0.0001 dan harga sekarang
-   ≤ 0.00003 → bot kirim notifikasi ke Telegram berisi nama koin, CA, harga,
-   dan volume 1 jam.
-4. Setelah notifikasi terkirim, koin itu "di-reset" — perlu melambung lagi ke
-   atas ambang batas sebelum bisa memicu notifikasi berikutnya (biar tidak spam).
+2. **Cek harga** (default: tiap **1 menit**) — untuk tiap koin di watchlist,
+   bot ambil harga, volume 1 jam, market cap, dan likuiditas dari
+   **DexScreener API** (gratis, tanpa API key, tanpa batas compute unit).
+
+## Isi notifikasi
+
+Nama token, CA, harga sekarang, volume 1 jam, market cap, link chart, dan
+(kalau relevan) label risiko likuiditas.
+
+## Aturan validasi data yang diterapkan
+
+- Harga selalu dalam USD (`priceUsd` dari DexScreener), tidak pernah
+  dicampur dengan harga native token.
+- Kalau harga tidak tersedia/tidak valid untuk suatu token, token itu
+  **dilewati** di siklus itu — tidak diasumsikan 0 atau nilai lain.
+- Kalau market cap tidak tersedia, notifikasi menampilkan **"Data tidak
+  tersedia"**, bukan angka yang diasumsikan atau dibulatkan sembarangan.
+- Kalau likuiditas tidak diketahui **atau** di bawah `LIQUIDITY_MIN_USD`
+  (default $10.000), notifikasi diberi label tambahan
+  **"⚠️ RISIKO LIKUIDITAS TINGGI"**.
+- **Keterbatasan yang perlu diketahui:** DexScreener (API gratis yang kita
+  pakai) tidak menyediakan data deteksi wash trading. Aturan "abaikan
+  transaksi wash trading" dari spesifikasi kamu belum bisa diterapkan
+  dengan sumber data ini — butuh API berbayar/khusus (mis. analitik on-chain
+  tingkat lanjut) untuk itu. Beri tahu saya kalau ini penting, supaya bisa
+  dicarikan opsi sumber data lain.
+
+## Kenapa satu koin bisa muncul berkali-kali
+
+Kalau sebuah koin sudah "mati" (harga sangat rendah, likuiditas tipis) tapi
+harganya berkali-kali sempat mantul tipis di atas `PRICE_HIGH` lalu jatuh
+lagi ke bawah `PRICE_LOW`, bot akan menganggapnya sebagai siklus baru tiap
+kali — ini bukan bug, tapi konsekuensi wajar dari definisi siklus di atas.
+Label **risiko likuiditas** dan **market cap** di notifikasi membantu kamu
+mengenali sinyal semacam ini dengan cepat tanpa perlu buka chart dulu.
 
 ## Setup
 
@@ -38,7 +74,7 @@ sebulan.
 - Cari nilai `"chat":{"id": ...}` — itu Chat ID kamu.
 
 ### 3. Daftar Birdeye API key (gratis)
-- Buat akun di [birdeye.so](https://birdeye.so) → ambil API key dari dashboard.
+- Buat akun di [birdeye.so](https://birdeye.so) → Menu → API → Security → **Generate key**.
 - Free tier: 30.000 compute unit/bulan, cukup untuk refresh watchlist tiap jam.
 
 ### 4. Isi environment variables
@@ -52,22 +88,24 @@ npm start
 
 ## Deploy ke Railway
 
-1. Push folder ini ke repo GitHub baru.
+1. Push folder ini ke repo GitHub.
 2. Di Railway: **New Project → Deploy from GitHub repo** → pilih repo ini.
 3. Buka tab **Variables**, masukkan semua isi `.env.example` dengan nilai asli.
 4. Railway otomatis jalankan `npm start`. Selesai — bot jalan 24/7.
 
-**Catatan:** disk di Railway bisa ter-reset saat redeploy, artinya `state.json`
-(watchlist + riwayat harga puncak) bisa hilang. Untuk pemakaian jangka panjang
-yang lebih andal, tambahkan **Railway Volume** dan arahkan `STATE_FILE` ke
-path volume tersebut — beri tahu saya kalau mau saya bantu setup itu.
+**Update dari deploy sebelumnya?** Cukup ubah nilai `PRICE_LOW` yang sudah
+ada dari `0.00003` menjadi `0.00005`, lalu tap **Add**/simpan — Railway
+otomatis redeploy. Tidak perlu bikin variable baru kecuali kamu mau
+mengubah `LIQUIDITY_MIN_USD` dari default $10.000.
+
+**Catatan:** disk di Railway bisa ter-reset saat redeploy, artinya
+`state.json` (watchlist + riwayat harga puncak) bisa hilang. Untuk
+pemakaian jangka panjang yang lebih andal, tambahkan **Railway Volume**
+dan arahkan `STATE_FILE` ke path volume tersebut — beri tahu saya kalau
+mau saya bantu setup itu.
 
 ## Menyesuaikan
 
-Ubah `PRICE_HIGH`, `PRICE_LOW`, `DISCOVER_INTERVAL_MINUTES`,
-`CHECK_INTERVAL_MINUTES`, atau `TOP_N` di environment variables kapan saja
-tanpa perlu ubah kode.
-
-⚠️ Kalau mau `DISCOVER_INTERVAL_MINUTES` lebih kecil dari 60, cek dulu jatah
-CU Birdeye kamu (dashboard birdeye.so) supaya tidak kehabisan sebelum akhir
-bulan.
+Ubah `PRICE_HIGH`, `PRICE_LOW`, `LIQUIDITY_MIN_USD`,
+`DISCOVER_INTERVAL_MINUTES`, `CHECK_INTERVAL_MINUTES`, atau `TOP_N` di
+environment variables kapan saja tanpa perlu ubah kode.

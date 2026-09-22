@@ -7,8 +7,16 @@ const http = require('http');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
-const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');
-const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00003');
+
+// PUMP_THRESHOLD & DUMP_THRESHOLD sesuai spesifikasi:
+// - Siklus dimulai saat harga pertama kali >= PRICE_HIGH (PUMP_THRESHOLD)
+// - Siklus berakhir (alert terkirim) saat harga turun <= PRICE_LOW (DUMP_THRESHOLD)
+// - Siklus baru butuh harga turun di bawah PRICE_HIGH dulu sebelum bisa aktif lagi
+const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');   // PUMP_THRESHOLD
+const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THRESHOLD
+
+// Ambang likuiditas (USD) — di bawah ini, notifikasi diberi label risiko
+const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 
 // Dua interval terpisah:
 // - DISCOVER: refresh daftar koin trending dari Birdeye (mahal secara compute unit, jadi jarang)
@@ -41,13 +49,23 @@ function saveState(state) {
 let state = loadState();
 
 // ==================== TELEGRAM ====================
-async function sendTelegramAlert({ symbol, name, address, price, volume1h, pairUrl }) {
+async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl }) {
+  const mcText = marketCap != null
+    ? `$${Number(marketCap).toLocaleString('en-US')}`
+    : 'Data tidak tersedia';
+
+  // Sesuai aturan validasi: kalau likuiditas tidak diketahui atau di bawah ambang, jangan asumsikan aman
+  const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
+  const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
+
   const text =
     `🚨 <b>Sinyal Ditemukan</b>\n\n` +
     `Koin: <b>${escapeHtml(symbol)}</b> (${escapeHtml(name)})\n` +
     `CA: <code>${address}</code>\n` +
     `Harga sekarang: $${price}\n` +
     `Volume 1 Jam: $${Number(volume1h).toLocaleString('en-US')}\n` +
+    `Market Cap: ${mcText}` +
+    riskLine + `\n` +
     (pairUrl ? `Chart: ${pairUrl}` : '');
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -104,7 +122,7 @@ async function refreshWatchlist() {
   }
 }
 
-// ==================== DEXSCREENER: harga & volume 1h akurat (gratis, bisa sering) ====================
+// ==================== DEXSCREENER: harga, volume, marketcap, likuiditas ====================
 async function getTokenMarketData(address) {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
   const res = await fetch(url);
@@ -116,12 +134,18 @@ async function getTokenMarketData(address) {
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
 
+  // Aturan validasi: kalau harga tidak tersedia/valid, jangan diasumsikan 0 — anggap data tidak ada
+  const priceNum = parseFloat(p.priceUsd);
+  if (!p.priceUsd || Number.isNaN(priceNum)) return null;
+
   return {
     address,
     symbol: p.baseToken?.symbol || '?',
     name: p.baseToken?.name || '?',
-    price: parseFloat(p.priceUsd || '0'),
+    price: priceNum, // selalu harga USD (priceUsd), tidak dicampur dengan harga native
     volume1h: p.volume?.h1 || 0,
+    marketCap: p.marketCap ?? p.fdv ?? null, // null kalau memang tidak tersedia, bukan diasumsikan 0
+    liquidityUsd: p.liquidity?.usd ?? null,
     pairUrl: p.url,
   };
 }
@@ -142,18 +166,19 @@ async function checkPricesOnce() {
       console.error(`Gagal ambil data ${addr}:`, err.message);
       continue;
     }
-    if (!data) continue;
+    if (!data) continue; // data tidak lengkap/valid — dilewati, tidak diasumsikan
 
     const entry = state.prices[addr] || { maxPrice: 0 };
     if (data.price > entry.maxPrice) entry.maxPrice = data.price;
 
+    // Definisi siklus: sudah pernah >= PUMP_THRESHOLD (PRICE_HIGH), sekarang <= DUMP_THRESHOLD (PRICE_LOW)
     const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
     const sudahTurun = data.price <= PRICE_LOW;
 
     if (sudahMelambung && sudahTurun) {
       console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price}`);
       await sendTelegramAlert(data);
-      entry.maxPrice = data.price; // reset: butuh melambung lagi untuk trigger berikutnya
+      entry.maxPrice = data.price; // reset — siklus baru butuh harga naik ke atas PRICE_HIGH lagi
     }
 
     state.prices[addr] = entry;
