@@ -13,26 +13,17 @@ const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THR
 
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
-
-// Diturunkan lagi dari $35rb: filter dexId=pumpfun di bawah sudah menangani token yang
-// belum lulus bonding curve secara lebih presisi. Ambang ini sekarang cuma jaring pengaman
-// dasar (bukan sekadar 0/nyaris mati), supaya tidak bentrok dengan target V-shape yang
-// kadang dump balik ke bawah level market cap graduasi.
 const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
-
-// Umur token (sejak pair dibuat) sesuai pengalaman trading kamu: V-shape rebound paling
-// sering terjadi pada koin berumur 20 menit - 1 jam. Di luar rentang ini, token ditolak.
-// Set MIN ke 0 dan MAX ke angka besar untuk menonaktifkan filter ini.
-const MIN_TOKEN_AGE_MINUTES = parseFloat(process.env.MIN_TOKEN_AGE_MINUTES || '20');
-const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '60');
-
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
-
 const RUGCHECK_MAX_RISK_SCORE = parseFloat(process.env.RUGCHECK_MAX_RISK_SCORE || '50');
 
-// dexId pair yang ditolak total (bonding curve pump.fun, belum lulus ke AMM sungguhan).
-// PumpSwap (sudah lulus) TIDAK termasuk di sini.
-const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || 'pumpfun')
+// Jumlah holder minimum. Sumber: Birdeye token_overview (field "holder"), field yang
+// terdokumentasi jelas — bukan tebakan seperti field holder di RugCheck sebelumnya.
+// Di-cache per token, jadi cuma 1x panggilan per koin baru (hemat compute unit Birdeye).
+const MIN_HOLDER_COUNT = parseInt(process.env.MIN_HOLDER_COUNT || '600', 10);
+const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'true') === 'true';
+
+const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 const DEFAULT_SCAM_KEYWORDS = [
@@ -45,6 +36,9 @@ const EXTRA_SCAM_KEYWORDS = (process.env.EXTRA_SCAM_KEYWORDS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const SCAM_KEYWORDS = [...DEFAULT_SCAM_KEYWORDS, ...EXTRA_SCAM_KEYWORDS];
 
+const MIN_TOKEN_AGE_MINUTES = parseFloat(process.env.MIN_TOKEN_AGE_MINUTES || '20');
+const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '60');
+
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
@@ -53,7 +47,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-23-v11 (filter umur token 20-60 menit, market cap diturunkan ke 10rb)');
+console.log('gmgn-alert-bot — versi 2026-09-23-v13 (holder count via Birdeye token_overview, bukan tebakan RugCheck)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -113,7 +107,7 @@ function isBrandImpersonation(symbol, name) {
   return SCAM_KEYWORDS.some((kw) => text.includes(kw));
 }
 
-// ==================== RUGCHECK: keamanan on-chain ====================
+// ==================== RUGCHECK: skor risiko + status mint/freeze authority ====================
 async function checkRugCheckSafety(address) {
   try {
     const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report/summary`;
@@ -139,6 +133,21 @@ async function checkRugCheckSafety(address) {
     return { safe: true, reason: null };
   } catch (err) {
     return { safe: true, reason: `RugCheck error (dilewati): ${err.message}` };
+  }
+}
+
+// ==================== BIRDEYE: jumlah holder (field "holder" di token_overview) ====================
+async function getHolderCount(address) {
+  try {
+    const url = `https://public-api.birdeye.so/defi/token_overview?address=${address}`;
+    const res = await fetch(url, {
+      headers: { accept: 'application/json', 'x-chain': 'solana', 'X-API-KEY': BIRDEYE_API_KEY },
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.data?.holder ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -233,12 +242,10 @@ async function getTokenMarketData(address) {
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
 
-  // Gate 0a: tolak pair yang masih di bonding curve pump.fun (belum lulus ke AMM sungguhan)
   const dexId = (p.dexId || '').toLowerCase();
-  if (EXCLUDE_DEX_IDS.some((ex) => dexId.includes(ex))) return null;
+  if (EXCLUDE_DEX_IDS.length > 0 && EXCLUDE_DEX_IDS.some((ex) => dexId.includes(ex))) return null;
 
-  // Gate 0b: umur token harus di rentang yang kamu incar (default 20-60 menit)
-  if (!p.pairCreatedAt) return null; // tidak diketahui umurnya, jangan diasumsikan aman
+  if (!p.pairCreatedAt) return null;
   const ageMinutes = (Date.now() - p.pairCreatedAt) / 60000;
   if (ageMinutes < MIN_TOKEN_AGE_MINUTES || ageMinutes > MAX_TOKEN_AGE_MINUTES) return null;
 
@@ -247,31 +254,44 @@ async function getTokenMarketData(address) {
 
   const symbol = p.baseToken?.symbol || '?';
   const name = p.baseToken?.name || '?';
-
-  // Gate 1: tolak token yang meniru nama brand terkenal
   if (isBrandImpersonation(symbol, name)) return null;
 
   const liquidityUsd = p.liquidity?.usd ?? null;
-  // Gate 2: likuiditas terlalu tipis = harga rawan palsu/outlier
   if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
 
   const marketCap = p.marketCap ?? p.fdv ?? null;
-  // Gate 3: market cap di bawah ambang graduasi = koin belum "lulus", rawan manipulasi
   if (MIN_MARKET_CAP_USD > 0 && (marketCap == null || marketCap < MIN_MARKET_CAP_USD)) return null;
 
   const volume1h = p.volume?.h1 || 0;
-  // Gate 4: volume 1 jam nyaris nol = tidak ada aktivitas trading nyata
   if (volume1h < MIN_VOLUME_1H_USD) return null;
 
-  // Gate 5: RugCheck (mint/freeze authority, skor risiko) — di-cache per token
-  const cached = state.prices[address];
-  if (cached && cached.rugcheckSafe === false) return null;
-  if (!cached || cached.rugcheckSafe === undefined) {
+  // Cache per-token untuk RugCheck (safety) dan holder count — supaya tidak dipanggil ulang tiap menit
+  const cached = state.prices[address] || {};
+  state.prices[address] = state.prices[address] || { maxPrice: 0 };
+
+  if (cached.rugcheckSafe === undefined) {
     const rc = await checkRugCheckSafety(address);
-    state.prices[address] = state.prices[address] || { maxPrice: 0 };
     state.prices[address].rugcheckSafe = rc.safe;
     if (!rc.safe) {
       console.log(`Ditolak (RugCheck): ${symbol} (${address}) — ${rc.reason}`);
+      return null;
+    }
+  } else if (cached.rugcheckSafe === false) {
+    return null;
+  }
+
+  if (ENABLE_HOLDER_CHECK) {
+    if (cached.holderCount === undefined) {
+      const holderCount = await getHolderCount(address);
+      state.prices[address].holderCount = holderCount;
+      if (holderCount != null && holderCount < MIN_HOLDER_COUNT) {
+        console.log(`Ditolak (holder): ${symbol} (${address}) — ${holderCount} holder (min ${MIN_HOLDER_COUNT})`);
+        return null;
+      }
+      if (holderCount == null) {
+        console.log(`Peringatan: jumlah holder ${symbol} (${address}) tidak terbaca dari Birdeye — gate holder dilewati untuk token ini.`);
+      }
+    } else if (cached.holderCount != null && cached.holderCount < MIN_HOLDER_COUNT) {
       return null;
     }
   }
