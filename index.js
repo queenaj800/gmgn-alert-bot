@@ -47,7 +47,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-23-v13 (holder count via Birdeye token_overview, bukan tebakan RugCheck)');
+console.log('gmgn-alert-bot — versi 2026-09-24-v14 (gate holder fail-closed: tidak terbaca = ditolak, dicoba lagi siklus berikutnya)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -284,12 +284,17 @@ async function getTokenMarketData(address) {
     if (cached.holderCount === undefined) {
       const holderCount = await getHolderCount(address);
       state.prices[address].holderCount = holderCount;
-      if (holderCount != null && holderCount < MIN_HOLDER_COUNT) {
-        console.log(`Ditolak (holder): ${symbol} (${address}) — ${holderCount} holder (min ${MIN_HOLDER_COUNT})`);
+      if (holderCount == null) {
+        // FAIL-CLOSED: token belum terindeks Birdeye = belum "terverifikasi", ditolak
+        // dulu (bukan diloloskan). Biasanya akan lolos di siklus berikutnya kalau
+        // Birdeye sudah sempat mengindeksnya.
+        console.log(`Ditolak (holder tidak terbaca): ${symbol} (${address}) — belum terindeks Birdeye, dicoba lagi siklus berikutnya.`);
+        state.prices[address].holderCount = undefined; // coba lagi nanti, jangan di-cache sebagai gagal permanen
         return null;
       }
-      if (holderCount == null) {
-        console.log(`Peringatan: jumlah holder ${symbol} (${address}) tidak terbaca dari Birdeye — gate holder dilewati untuk token ini.`);
+      if (holderCount < MIN_HOLDER_COUNT) {
+        console.log(`Ditolak (holder): ${symbol} (${address}) — ${holderCount} holder (min ${MIN_HOLDER_COUNT})`);
+        return null;
       }
     } else if (cached.holderCount != null && cached.holderCount < MIN_HOLDER_COUNT) {
       return null;
