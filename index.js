@@ -14,9 +14,17 @@ const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THR
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
 
-// Pump.fun "meluluskan" token dari bonding curve ke AMM sungguhan (PumpSwap) di market cap
-// sekitar $30.000-35.000. Di bawah itu, harga sangat mudah dimanipulasi dengan modal kecil.
-const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '35000');
+// Diturunkan lagi dari $35rb: filter dexId=pumpfun di bawah sudah menangani token yang
+// belum lulus bonding curve secara lebih presisi. Ambang ini sekarang cuma jaring pengaman
+// dasar (bukan sekadar 0/nyaris mati), supaya tidak bentrok dengan target V-shape yang
+// kadang dump balik ke bawah level market cap graduasi.
+const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
+
+// Umur token (sejak pair dibuat) sesuai pengalaman trading kamu: V-shape rebound paling
+// sering terjadi pada koin berumur 20 menit - 1 jam. Di luar rentang ini, token ditolak.
+// Set MIN ke 0 dan MAX ke angka besar untuk menonaktifkan filter ini.
+const MIN_TOKEN_AGE_MINUTES = parseFloat(process.env.MIN_TOKEN_AGE_MINUTES || '20');
+const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '60');
 
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
 
@@ -45,7 +53,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-23-v10 (ambang graduasi pump.fun + filter dexId bonding curve + fix keyword claude)');
+console.log('gmgn-alert-bot — versi 2026-09-23-v11 (filter umur token 20-60 menit, market cap diturunkan ke 10rb)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -225,9 +233,14 @@ async function getTokenMarketData(address) {
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
 
-  // Gate 0: tolak pair yang masih di bonding curve pump.fun (belum lulus ke AMM sungguhan)
+  // Gate 0a: tolak pair yang masih di bonding curve pump.fun (belum lulus ke AMM sungguhan)
   const dexId = (p.dexId || '').toLowerCase();
   if (EXCLUDE_DEX_IDS.some((ex) => dexId.includes(ex))) return null;
+
+  // Gate 0b: umur token harus di rentang yang kamu incar (default 20-60 menit)
+  if (!p.pairCreatedAt) return null; // tidak diketahui umurnya, jangan diasumsikan aman
+  const ageMinutes = (Date.now() - p.pairCreatedAt) / 60000;
+  if (ageMinutes < MIN_TOKEN_AGE_MINUTES || ageMinutes > MAX_TOKEN_AGE_MINUTES) return null;
 
   const priceNum = parseFloat(p.priceUsd);
   if (!p.priceUsd || Number.isNaN(priceNum)) return null;
