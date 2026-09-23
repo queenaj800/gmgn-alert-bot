@@ -13,19 +13,25 @@ const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THR
 
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
-const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
+
+// Pump.fun "meluluskan" token dari bonding curve ke AMM sungguhan (PumpSwap) di market cap
+// sekitar $30.000-35.000. Di bawah itu, harga sangat mudah dimanipulasi dengan modal kecil.
+const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '35000');
+
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
 
-// Skor risiko RugCheck (0-100, makin tinggi makin bahaya). Token dengan skor >= ini ditolak.
 const RUGCHECK_MAX_RISK_SCORE = parseFloat(process.env.RUGCHECK_MAX_RISK_SCORE || '50');
 
-// Daftar kata kunci brand/nama terkenal yang sering ditiru untuk scam.
-// Bisa ditambah lewat env EXTRA_SCAM_KEYWORDS (pisahkan koma), digabung dengan daftar default ini.
+// dexId pair yang ditolak total (bonding curve pump.fun, belum lulus ke AMM sungguhan).
+// PumpSwap (sudah lulus) TIDAK termasuk di sini.
+const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || 'pumpfun')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
 const DEFAULT_SCAM_KEYWORDS = [
   'openai', 'chatgpt', 'gpt-5', 'gpt5', 'robinhood', 'tesla', 'elonmusk', 'elon musk', 'spacex',
   'apple inc', 'nvidia', 'microsoft', 'google', 'amazon', 'meta platforms', 'facebook',
   'trump', 'binance', 'coinbase', 'blackrock', 'jpmorgan', 'visa', 'mastercard',
-  'paypal', 'netflix', 'disney', 'nike', 'samsung', 'twitter', 'anthropic', 'claude ai',
+  'paypal', 'netflix', 'disney', 'nike', 'samsung', 'twitter', 'anthropic', 'claude ai', 'claude',
 ];
 const EXTRA_SCAM_KEYWORDS = (process.env.EXTRA_SCAM_KEYWORDS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -34,16 +40,12 @@ const SCAM_KEYWORDS = [...DEFAULT_SCAM_KEYWORDS, ...EXTRA_SCAM_KEYWORDS];
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
-
-// GeckoTerminal (gratis) izinkan hingga 10 halaman x 20 pool tanpa API key.
-// Makin banyak halaman = makin luas cakupan, tapi makin lama siklus cek harga tiap menit.
-// 3 halaman (60 pool) sudah keseimbangan aman; naikkan kalau mau lebih luas.
 const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-23-v9 (GeckoTerminal multi-page + anti-tumpang-tindih)');
+console.log('gmgn-alert-bot — versi 2026-09-23-v10 (ambang graduasi pump.fun + filter dexId bonding curve + fix keyword claude)');
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -103,7 +105,7 @@ function isBrandImpersonation(symbol, name) {
   return SCAM_KEYWORDS.some((kw) => text.includes(kw));
 }
 
-// ==================== RUGCHECK: keamanan on-chain (mint/freeze authority, skor risiko) ====================
+// ==================== RUGCHECK: keamanan on-chain ====================
 async function checkRugCheckSafety(address) {
   try {
     const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report/summary`;
@@ -128,7 +130,6 @@ async function checkRugCheckSafety(address) {
     }
     return { safe: true, reason: null };
   } catch (err) {
-    // Fail-open: kalau RugCheck error/timeout, jangan blokir sinyal hanya karena API pihak ketiga ini down
     return { safe: true, reason: `RugCheck error (dilewati): ${err.message}` };
   }
 }
@@ -144,7 +145,7 @@ async function getBirdeyeCandidates() {
   return (json?.data?.tokens || []).map((t) => t.address).filter(Boolean);
 }
 
-// ==================== SUMBER DISCOVERY 2: GECKOTERMINAL (by volume 1 JAM — asli) ====================
+// ==================== SUMBER DISCOVERY 2: GECKOTERMINAL (by volume 1 JAM — asli, multi-halaman) ====================
 async function getGeckoTerminalTrendingPools() {
   const allAddresses = [];
   for (let page = 1; page <= GECKO_PAGES; page++) {
@@ -156,9 +157,9 @@ async function getGeckoTerminalTrendingPools() {
     }
     const json = await res.json();
     const pageAddrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
-    if (pageAddrs.length === 0) break; // sudah habis halamannya
+    if (pageAddrs.length === 0) break;
     allAddresses.push(...pageAddrs);
-    await sleep(300); // jaga-jaga rate limit GeckoTerminal (30 req/menit)
+    await sleep(300);
   }
   return allAddresses;
 }
@@ -224,13 +225,17 @@ async function getTokenMarketData(address) {
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
 
+  // Gate 0: tolak pair yang masih di bonding curve pump.fun (belum lulus ke AMM sungguhan)
+  const dexId = (p.dexId || '').toLowerCase();
+  if (EXCLUDE_DEX_IDS.some((ex) => dexId.includes(ex))) return null;
+
   const priceNum = parseFloat(p.priceUsd);
   if (!p.priceUsd || Number.isNaN(priceNum)) return null;
 
   const symbol = p.baseToken?.symbol || '?';
   const name = p.baseToken?.name || '?';
 
-  // Gate 1 (gratis, instan): tolak token yang meniru nama brand terkenal
+  // Gate 1: tolak token yang meniru nama brand terkenal
   if (isBrandImpersonation(symbol, name)) return null;
 
   const liquidityUsd = p.liquidity?.usd ?? null;
@@ -238,15 +243,14 @@ async function getTokenMarketData(address) {
   if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
 
   const marketCap = p.marketCap ?? p.fdv ?? null;
-  // Gate 3: market cap terlalu kecil/tidak diketahui = koin sudah mati/rugpull
+  // Gate 3: market cap di bawah ambang graduasi = koin belum "lulus", rawan manipulasi
   if (MIN_MARKET_CAP_USD > 0 && (marketCap == null || marketCap < MIN_MARKET_CAP_USD)) return null;
 
   const volume1h = p.volume?.h1 || 0;
   // Gate 4: volume 1 jam nyaris nol = tidak ada aktivitas trading nyata
   if (volume1h < MIN_VOLUME_1H_USD) return null;
 
-  // Gate 5: RugCheck (mint/freeze authority, skor risiko) — di-cache per token supaya tidak
-  // memanggil API ini berkali-kali tiap menit untuk token yang sama.
+  // Gate 5: RugCheck (mint/freeze authority, skor risiko) — di-cache per token
   const cached = state.prices[address];
   if (cached && cached.rugcheckSafe === false) return null;
   if (!cached || cached.rugcheckSafe === undefined) {
@@ -263,7 +267,7 @@ async function getTokenMarketData(address) {
 }
 
 // ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit) ====================
-let isChecking = false; // cegah dua siklus cek harga berjalan bersamaan kalau watchlist besar
+let isChecking = false;
 async function checkPricesOnce() {
   if (isChecking) {
     console.log('Siklus cek harga sebelumnya masih berjalan, lewati siklus ini.');
