@@ -17,9 +17,6 @@ const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000')
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
 const RUGCHECK_MAX_RISK_SCORE = parseFloat(process.env.RUGCHECK_MAX_RISK_SCORE || '50');
 
-// Jumlah holder minimum. Sumber: Birdeye token_overview (field "holder"), field yang
-// terdokumentasi jelas — bukan tebakan seperti field holder di RugCheck sebelumnya.
-// Di-cache per token, jadi cuma 1x panggilan per koin baru (hemat compute unit Birdeye).
 const MIN_HOLDER_COUNT = parseInt(process.env.MIN_HOLDER_COUNT || '600', 10);
 const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'true') === 'true';
 
@@ -40,14 +37,21 @@ const MIN_TOKEN_AGE_MINUTES = parseFloat(process.env.MIN_TOKEN_AGE_MINUTES || '2
 const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '60');
 
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '1', 10) * 60 * 1000;
+
+// Interval cek harga: kalau CHECK_INTERVAL_SECONDS diisi, itu yang dipakai (lebih presisi,
+// bisa di bawah 1 menit). Kalau kosong, fallback ke CHECK_INTERVAL_MINUTES (default 1 menit).
+const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
+  ? parseFloat(process.env.CHECK_INTERVAL_SECONDS) * 1000
+  : parseFloat(process.env.CHECK_INTERVAL_MINUTES || '1') * 60 * 1000;
+
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
 const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-24-v14 (gate holder fail-closed: tidak terbaca = ditolak, dicoba lagi siklus berikutnya)');
+console.log('gmgn-alert-bot — versi 2026-09-24-v15 (interval cek harga bisa per detik via CHECK_INTERVAL_SECONDS)');
+console.log(`Interval cek harga aktif: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -265,7 +269,6 @@ async function getTokenMarketData(address) {
   const volume1h = p.volume?.h1 || 0;
   if (volume1h < MIN_VOLUME_1H_USD) return null;
 
-  // Cache per-token untuk RugCheck (safety) dan holder count — supaya tidak dipanggil ulang tiap menit
   const cached = state.prices[address] || {};
   state.prices[address] = state.prices[address] || { maxPrice: 0 };
 
@@ -283,15 +286,13 @@ async function getTokenMarketData(address) {
   if (ENABLE_HOLDER_CHECK) {
     if (cached.holderCount === undefined) {
       const holderCount = await getHolderCount(address);
-      state.prices[address].holderCount = holderCount;
       if (holderCount == null) {
-        // FAIL-CLOSED: token belum terindeks Birdeye = belum "terverifikasi", ditolak
-        // dulu (bukan diloloskan). Biasanya akan lolos di siklus berikutnya kalau
-        // Birdeye sudah sempat mengindeksnya.
+        // FAIL-CLOSED: belum terindeks Birdeye = belum "terverifikasi", ditolak dulu.
+        // Tidak di-cache sebagai gagal permanen, supaya dicoba lagi siklus berikutnya.
         console.log(`Ditolak (holder tidak terbaca): ${symbol} (${address}) — belum terindeks Birdeye, dicoba lagi siklus berikutnya.`);
-        state.prices[address].holderCount = undefined; // coba lagi nanti, jangan di-cache sebagai gagal permanen
         return null;
       }
+      state.prices[address].holderCount = holderCount;
       if (holderCount < MIN_HOLDER_COUNT) {
         console.log(`Ditolak (holder): ${symbol} (${address}) — ${holderCount} holder (min ${MIN_HOLDER_COUNT})`);
         return null;
@@ -304,7 +305,7 @@ async function getTokenMarketData(address) {
   return { address, symbol, name, price: priceNum, volume1h, marketCap, liquidityUsd, pairUrl: p.url };
 }
 
-// ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit) ====================
+// ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit, bisa per detik) ====================
 let isChecking = false;
 async function checkPricesOnce() {
   if (isChecking) {
@@ -348,7 +349,7 @@ async function checkPricesOnceInner() {
     }
 
     state.prices[addr] = entry;
-    await sleep(150);
+    await sleep(100);
   }
 
   saveState(state);
