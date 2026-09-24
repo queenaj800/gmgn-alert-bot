@@ -50,7 +50,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-24-v15 (interval cek harga bisa per detik via CHECK_INTERVAL_SECONDS)');
+console.log('gmgn-alert-bot — versi 2026-09-24-v16 (jeda GeckoTerminal diperbaiki, hindari rate limit 429)');
 console.log(`Interval cek harga aktif: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -180,7 +180,7 @@ async function getGeckoTerminalTrendingPools() {
     const pageAddrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
     if (pageAddrs.length === 0) break;
     allAddresses.push(...pageAddrs);
-    await sleep(300);
+    await sleep(2500); // batas gratis GeckoTerminal ~30 panggilan/menit, beri jeda aman
   }
   return allAddresses;
 }
