@@ -38,11 +38,13 @@ const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '6
 
 const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
 
-// Interval cek harga: kalau CHECK_INTERVAL_SECONDS diisi, itu yang dipakai (lebih presisi,
-// bisa di bawah 1 menit). Kalau kosong, fallback ke CHECK_INTERVAL_MINUTES (default 1 menit).
 const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
   ? parseFloat(process.env.CHECK_INTERVAL_SECONDS) * 1000
   : parseFloat(process.env.CHECK_INTERVAL_MINUTES || '1') * 60 * 1000;
+
+// Jumlah koin yang dicek BERSAMAAN (paralel) per batch. Makin besar = makin cepat
+// 1 siklus selesai, tapi makin berat beban ke DexScreener sesaat. 5 sudah aman.
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '5', 10);
 
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
 const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
@@ -50,8 +52,8 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-24-v16 (jeda GeckoTerminal diperbaiki, hindari rate limit 429)');
-console.log(`Interval cek harga aktif: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
+console.log('gmgn-alert-bot — versi 2026-09-24-v17 (cek harga paralel per batch, Birdeye & RugCheck tetap diantre)');
+console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -72,6 +74,29 @@ function saveState(state) {
 }
 
 let state = loadState();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ==================== ANTREAN KHUSUS BIRDEYE & RUGCHECK ====================
+// Walau cek harga jalan paralel, panggilan ke Birdeye (limit 1 req/detik di tier
+// gratis) dan RugCheck tetap diantre satu per satu dengan jeda aman, supaya tidak
+// kena rate limit seperti kasus GeckoTerminal sebelumnya.
+function makeThrottledQueue(minSpacingMs) {
+  let queue = Promise.resolve();
+  return function throttled(fn) {
+    const run = queue.then(async () => {
+      const result = await fn();
+      await sleep(minSpacingMs);
+      return result;
+    });
+    queue = run.catch(() => {});
+    return run;
+  };
+}
+const throttledBirdeye = makeThrottledQueue(1100); // jaga di bawah 1 req/detik
+const throttledRugCheck = makeThrottledQueue(300);
 
 // ==================== TELEGRAM ====================
 async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl }) {
@@ -103,9 +128,6 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
 function escapeHtml(str) {
   return String(str).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 function isBrandImpersonation(symbol, name) {
   const text = `${symbol || ''} ${name || ''}`.toLowerCase();
   return SCAM_KEYWORDS.some((kw) => text.includes(kw));
@@ -113,57 +135,63 @@ function isBrandImpersonation(symbol, name) {
 
 // ==================== RUGCHECK: skor risiko + status mint/freeze authority ====================
 async function checkRugCheckSafety(address) {
-  try {
-    const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report/summary`;
-    const res = await fetch(url, { headers: { accept: 'application/json' } });
-    if (!res.ok) return { safe: true, reason: 'RugCheck tidak tersedia untuk token ini (dilewati)' };
-    const json = await res.json();
+  return throttledRugCheck(async () => {
+    try {
+      const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report/summary`;
+      const res = await fetch(url, { headers: { accept: 'application/json' } });
+      if (!res.ok) return { safe: true, reason: 'RugCheck tidak tersedia untuk token ini (dilewati)' };
+      const json = await res.json();
 
-    if (json?.rugged === true) {
-      return { safe: false, reason: 'RugCheck: token sudah terdeteksi rugged' };
+      if (json?.rugged === true) {
+        return { safe: false, reason: 'RugCheck: token sudah terdeteksi rugged' };
+      }
+      const riskScore = json?.score_normalised ?? null;
+      if (riskScore != null && riskScore >= RUGCHECK_MAX_RISK_SCORE) {
+        return { safe: false, reason: `RugCheck: skor risiko ${riskScore}/100 (ambang ${RUGCHECK_MAX_RISK_SCORE})` };
+      }
+      const risks = json?.risks || [];
+      const dangerousAuthority = risks.some((r) => {
+        const t = `${r?.name || ''} ${r?.description || ''}`.toLowerCase();
+        return (t.includes('mint authority') || t.includes('freeze authority')) && r?.level === 'danger';
+      });
+      if (dangerousAuthority) {
+        return { safe: false, reason: 'RugCheck: mint/freeze authority masih aktif' };
+      }
+      return { safe: true, reason: null };
+    } catch (err) {
+      return { safe: true, reason: `RugCheck error (dilewati): ${err.message}` };
     }
-    const riskScore = json?.score_normalised ?? null;
-    if (riskScore != null && riskScore >= RUGCHECK_MAX_RISK_SCORE) {
-      return { safe: false, reason: `RugCheck: skor risiko ${riskScore}/100 (ambang ${RUGCHECK_MAX_RISK_SCORE})` };
-    }
-    const risks = json?.risks || [];
-    const dangerousAuthority = risks.some((r) => {
-      const t = `${r?.name || ''} ${r?.description || ''}`.toLowerCase();
-      return (t.includes('mint authority') || t.includes('freeze authority')) && r?.level === 'danger';
-    });
-    if (dangerousAuthority) {
-      return { safe: false, reason: 'RugCheck: mint/freeze authority masih aktif' };
-    }
-    return { safe: true, reason: null };
-  } catch (err) {
-    return { safe: true, reason: `RugCheck error (dilewati): ${err.message}` };
-  }
+  });
 }
 
 // ==================== BIRDEYE: jumlah holder (field "holder" di token_overview) ====================
 async function getHolderCount(address) {
-  try {
-    const url = `https://public-api.birdeye.so/defi/token_overview?address=${address}`;
-    const res = await fetch(url, {
-      headers: { accept: 'application/json', 'x-chain': 'solana', 'X-API-KEY': BIRDEYE_API_KEY },
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json?.data?.holder ?? null;
-  } catch {
-    return null;
-  }
+  return throttledBirdeye(async () => {
+    try {
+      const url = `https://public-api.birdeye.so/defi/token_overview?address=${address}`;
+      const res = await fetch(url, {
+        headers: { accept: 'application/json', 'x-chain': 'solana', 'X-API-KEY': BIRDEYE_API_KEY },
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      return json?.data?.holder ?? null;
+    } catch {
+      return null;
+    }
+  });
 }
 
 // ==================== SUMBER DISCOVERY 1: BIRDEYE (by volume 24 jam) ====================
 async function getBirdeyeCandidates() {
-  const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${TOP_N}`;
-  const res = await fetch(url, {
-    headers: { accept: 'application/json', 'x-chain': 'solana', 'X-API-KEY': BIRDEYE_API_KEY },
+  return throttledBirdeye(async () => {
+    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${TOP_N}`;
+    const res = await fetch(url, {
+      headers: { accept: 'application/json', 'x-chain': 'solana', 'X-API-KEY': BIRDEYE_API_KEY },
+    });
+    if (!res.ok) throw new Error(`Birdeye error ${res.status}: ${await res.text()}`);
+    const json = await res.json();
+    return (json?.data?.tokens || []).map((t) => t.address).filter(Boolean);
   });
-  if (!res.ok) throw new Error(`Birdeye error ${res.status}: ${await res.text()}`);
-  const json = await res.json();
-  return (json?.data?.tokens || []).map((t) => t.address).filter(Boolean);
 }
 
 // ==================== SUMBER DISCOVERY 2: GECKOTERMINAL (by volume 1 JAM — asli, multi-halaman) ====================
@@ -180,7 +208,7 @@ async function getGeckoTerminalTrendingPools() {
     const pageAddrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
     if (pageAddrs.length === 0) break;
     allAddresses.push(...pageAddrs);
-    await sleep(2500); // batas gratis GeckoTerminal ~30 panggilan/menit, beri jeda aman
+    await sleep(2500); // batas gratis GeckoTerminal ~30 panggilan/menit
   }
   return allAddresses;
 }
@@ -287,8 +315,6 @@ async function getTokenMarketData(address) {
     if (cached.holderCount === undefined) {
       const holderCount = await getHolderCount(address);
       if (holderCount == null) {
-        // FAIL-CLOSED: belum terindeks Birdeye = belum "terverifikasi", ditolak dulu.
-        // Tidak di-cache sebagai gagal permanen, supaya dicoba lagi siklus berikutnya.
         console.log(`Ditolak (holder tidak terbaca): ${symbol} (${address}) — belum terindeks Birdeye, dicoba lagi siklus berikutnya.`);
         return null;
       }
@@ -305,7 +331,32 @@ async function getTokenMarketData(address) {
   return { address, symbol, name, price: priceNum, volume1h, marketCap, liquidityUsd, pairUrl: p.url };
 }
 
-// ==================== SIKLUS CEK HARGA (sering — default tiap 1 menit, bisa per detik) ====================
+// ==================== SIKLUS CEK HARGA (paralel per batch) ====================
+async function processOneToken(addr) {
+  let data;
+  try {
+    data = await getTokenMarketData(addr);
+  } catch (err) {
+    console.error(`Gagal ambil data ${addr}:`, err.message);
+    return;
+  }
+  if (!data) return;
+
+  const entry = state.prices[addr] || { maxPrice: 0 };
+  if (data.price > entry.maxPrice) entry.maxPrice = data.price;
+
+  const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
+  const sudahTurun = data.price <= PRICE_LOW;
+
+  if (sudahMelambung && sudahTurun) {
+    console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price}`);
+    await sendTelegramAlert(data);
+    entry.maxPrice = data.price;
+  }
+
+  state.prices[addr] = entry;
+}
+
 let isChecking = false;
 async function checkPricesOnce() {
   if (isChecking) {
@@ -324,32 +375,12 @@ async function checkPricesOnceInner() {
     console.log('Watchlist masih kosong, tunggu refresh pertama selesai...');
     return;
   }
-  console.log(`[${new Date().toISOString()}] Cek harga ${state.watchlist.length} koin di watchlist...`);
+  console.log(`[${new Date().toISOString()}] Cek harga ${state.watchlist.length} koin di watchlist (batch ${BATCH_SIZE})...`);
 
-  for (const addr of state.watchlist) {
-    let data;
-    try {
-      data = await getTokenMarketData(addr);
-    } catch (err) {
-      console.error(`Gagal ambil data ${addr}:`, err.message);
-      continue;
-    }
-    if (!data) continue;
-
-    const entry = state.prices[addr] || { maxPrice: 0 };
-    if (data.price > entry.maxPrice) entry.maxPrice = data.price;
-
-    const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
-    const sudahTurun = data.price <= PRICE_LOW;
-
-    if (sudahMelambung && sudahTurun) {
-      console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price}`);
-      await sendTelegramAlert(data);
-      entry.maxPrice = data.price;
-    }
-
-    state.prices[addr] = entry;
-    await sleep(100);
+  for (let i = 0; i < state.watchlist.length; i += BATCH_SIZE) {
+    const batch = state.watchlist.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map((addr) => processOneToken(addr)));
+    await sleep(50);
   }
 
   saveState(state);
