@@ -8,8 +8,8 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 
-const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');   // PUMP_THRESHOLD
-const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');    // DUMP_THRESHOLD
+const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');
+const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');
 
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
@@ -17,8 +17,15 @@ const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000')
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
 const RUGCHECK_MAX_RISK_SCORE = parseFloat(process.env.RUGCHECK_MAX_RISK_SCORE || '50');
 
+// Holder count dari Birdeye terbukti tidak akurat dari kasus nyata (SNDK vs OG) —
+// kemungkinan menghitung alamat historis, bukan holder aktif. Dimatikan secara default.
 const MIN_HOLDER_COUNT = parseInt(process.env.MIN_HOLDER_COUNT || '600', 10);
-const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'true') === 'true';
+const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'false') === 'true';
+
+// Gate baru: rata-rata ukuran transaksi (volume 1 jam / jumlah transaksi 1 jam).
+// Kecil sekali = ciri wash trading (banyak transaksi kecil dari banyak wallet untuk
+// menciptakan kesan aktivitas yang sebenarnya palsu) — persis pola yang diamati di OG.
+const MIN_AVG_TRADE_SIZE_USD = parseFloat(process.env.MIN_AVG_TRADE_SIZE_USD || '15');
 
 const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -44,10 +51,7 @@ const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '5', 10);
 
-// Momentum: jumlah pembacaan harga terakhir yang disimpan per koin, dipakai untuk
-// menghitung apakah harga masih turun / mulai stabil / mulai naik saat sinyal terkirim.
 const MOMENTUM_WINDOW = parseInt(process.env.MOMENTUM_WINDOW || '5', 10);
-// Di dalam rentang +/- persen ini dianggap "stabil" (bukan naik atau turun berarti).
 const MOMENTUM_FLAT_THRESHOLD_PCT = parseFloat(process.env.MOMENTUM_FLAT_THRESHOLD_PCT || '3');
 
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
@@ -56,8 +60,8 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-25-v18 (indikator momentum di notifikasi)');
-console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}. Jendela momentum: ${MOMENTUM_WINDOW} pembacaan.`);
+console.log('gmgn-alert-bot — versi 2026-09-25-v19 (gate holder dimatikan default, gate anti wash-trading ditambah)');
+console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}. Cek holder: ${ENABLE_HOLDER_CHECK}. Min rata-rata transaksi: $${MIN_AVG_TRADE_SIZE_USD}.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -188,7 +192,7 @@ async function checkRugCheckSafety(address) {
   });
 }
 
-// ==================== BIRDEYE: jumlah holder ====================
+// ==================== BIRDEYE: jumlah holder (opsional, dimatikan default) ====================
 async function getHolderCount(address) {
   return throttledBirdeye(async () => {
     try {
@@ -321,6 +325,16 @@ async function getTokenMarketData(address) {
   const volume1h = p.volume?.h1 || 0;
   if (volume1h < MIN_VOLUME_1H_USD) return null;
 
+  // Gate anti wash-trading: rata-rata ukuran transaksi terlalu kecil = mencurigakan
+  const txnsH1 = p.txns?.h1;
+  const txnCount = txnsH1 ? (txnsH1.buys || 0) + (txnsH1.sells || 0) : 0;
+  if (txnCount === 0) return null; // volume ada tapi transaksi 0 = data tidak konsisten
+  const avgTradeSize = volume1h / txnCount;
+  if (avgTradeSize < MIN_AVG_TRADE_SIZE_USD) {
+    console.log(`Ditolak (wash trading?): ${symbol} (${address}) — rata-rata transaksi $${avgTradeSize.toFixed(2)} dari ${txnCount}x (min $${MIN_AVG_TRADE_SIZE_USD})`);
+    return null;
+  }
+
   const cached = state.prices[address] || {};
   state.prices[address] = state.prices[address] || { maxPrice: 0 };
 
@@ -369,7 +383,6 @@ async function processOneToken(addr) {
   const entry = state.prices[addr] || { maxPrice: 0 };
   if (data.price > entry.maxPrice) entry.maxPrice = data.price;
 
-  // Rekam histori harga singkat untuk hitung momentum saat sinyal terkirim
   entry.recentPrices = entry.recentPrices || [];
   entry.recentPrices.push({ price: data.price, t: Date.now() });
   if (entry.recentPrices.length > MOMENTUM_WINDOW) {
@@ -384,7 +397,7 @@ async function processOneToken(addr) {
     console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price} — momentum: ${momentum.label}`);
     await sendTelegramAlert({ ...data, momentum });
     entry.maxPrice = data.price;
-    entry.recentPrices = []; // mulai segar untuk siklus/sinyal berikutnya
+    entry.recentPrices = [];
   }
 
   state.prices[addr] = entry;
