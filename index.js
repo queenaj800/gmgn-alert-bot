@@ -42,9 +42,13 @@ const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
   ? parseFloat(process.env.CHECK_INTERVAL_SECONDS) * 1000
   : parseFloat(process.env.CHECK_INTERVAL_MINUTES || '1') * 60 * 1000;
 
-// Jumlah koin yang dicek BERSAMAAN (paralel) per batch. Makin besar = makin cepat
-// 1 siklus selesai, tapi makin berat beban ke DexScreener sesaat. 5 sudah aman.
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '5', 10);
+
+// Momentum: jumlah pembacaan harga terakhir yang disimpan per koin, dipakai untuk
+// menghitung apakah harga masih turun / mulai stabil / mulai naik saat sinyal terkirim.
+const MOMENTUM_WINDOW = parseInt(process.env.MOMENTUM_WINDOW || '5', 10);
+// Di dalam rentang +/- persen ini dianggap "stabil" (bukan naik atau turun berarti).
+const MOMENTUM_FLAT_THRESHOLD_PCT = parseFloat(process.env.MOMENTUM_FLAT_THRESHOLD_PCT || '3');
 
 const TOP_N = parseInt(process.env.TOP_N || '50', 10);
 const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
@@ -52,8 +56,8 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-24-v17 (cek harga paralel per batch, Birdeye & RugCheck tetap diantre)');
-console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}.`);
+console.log('gmgn-alert-bot — versi 2026-09-25-v18 (indikator momentum di notifikasi)');
+console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}. Jendela momentum: ${MOMENTUM_WINDOW} pembacaan.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -80,9 +84,6 @@ function sleep(ms) {
 }
 
 // ==================== ANTREAN KHUSUS BIRDEYE & RUGCHECK ====================
-// Walau cek harga jalan paralel, panggilan ke Birdeye (limit 1 req/detik di tier
-// gratis) dan RugCheck tetap diantre satu per satu dengan jeda aman, supaya tidak
-// kena rate limit seperti kasus GeckoTerminal sebelumnya.
 function makeThrottledQueue(minSpacingMs) {
   let queue = Promise.resolve();
   return function throttled(fn) {
@@ -95,14 +96,36 @@ function makeThrottledQueue(minSpacingMs) {
     return run;
   };
 }
-const throttledBirdeye = makeThrottledQueue(1100); // jaga di bawah 1 req/detik
+const throttledBirdeye = makeThrottledQueue(1100);
 const throttledRugCheck = makeThrottledQueue(300);
 
+// ==================== MOMENTUM ====================
+function computeMomentum(recentPrices) {
+  if (!recentPrices || recentPrices.length < 2) {
+    return { label: 'data belum cukup', pct: null, seconds: null };
+  }
+  const oldest = recentPrices[0];
+  const newest = recentPrices[recentPrices.length - 1];
+  const pct = ((newest.price - oldest.price) / oldest.price) * 100;
+  const seconds = Math.max(1, Math.round((newest.t - oldest.t) / 1000));
+
+  let label;
+  if (pct <= -MOMENTUM_FLAT_THRESHOLD_PCT) label = '📉 Masih turun';
+  else if (pct >= MOMENTUM_FLAT_THRESHOLD_PCT) label = '📈 Mulai naik';
+  else label = '➡️ Mulai stabil';
+
+  return { label, pct, seconds };
+}
+
 // ==================== TELEGRAM ====================
-async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl }) {
+async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum }) {
   const mcText = marketCap != null ? `$${Number(marketCap).toLocaleString('en-US')}` : 'Data tidak tersedia';
   const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
   const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
+
+  const momentumLine = momentum && momentum.pct != null
+    ? `\nMomentum: ${momentum.label} (${momentum.pct.toFixed(1)}% dalam ${momentum.seconds}d terakhir)`
+    : `\nMomentum: data belum cukup`;
 
   const text =
     `🚨 <b>Sinyal Ditemukan</b>\n\n` +
@@ -111,7 +134,8 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
     `Harga sekarang: $${price}\n` +
     `Volume 1 Jam: $${Number(volume1h).toLocaleString('en-US')}\n` +
     `Market Cap: ${mcText}` +
-    riskLine + `\n` +
+    riskLine +
+    momentumLine + `\n` +
     (pairUrl ? `Chart: ${pairUrl}` : '');
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -164,7 +188,7 @@ async function checkRugCheckSafety(address) {
   });
 }
 
-// ==================== BIRDEYE: jumlah holder (field "holder" di token_overview) ====================
+// ==================== BIRDEYE: jumlah holder ====================
 async function getHolderCount(address) {
   return throttledBirdeye(async () => {
     try {
@@ -181,7 +205,7 @@ async function getHolderCount(address) {
   });
 }
 
-// ==================== SUMBER DISCOVERY 1: BIRDEYE (by volume 24 jam) ====================
+// ==================== SUMBER DISCOVERY 1: BIRDEYE ====================
 async function getBirdeyeCandidates() {
   return throttledBirdeye(async () => {
     const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${TOP_N}`;
@@ -194,7 +218,7 @@ async function getBirdeyeCandidates() {
   });
 }
 
-// ==================== SUMBER DISCOVERY 2: GECKOTERMINAL (by volume 1 JAM — asli, multi-halaman) ====================
+// ==================== SUMBER DISCOVERY 2: GECKOTERMINAL ====================
 async function getGeckoTerminalTrendingPools() {
   const allAddresses = [];
   for (let page = 1; page <= GECKO_PAGES; page++) {
@@ -208,7 +232,7 @@ async function getGeckoTerminalTrendingPools() {
     const pageAddrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
     if (pageAddrs.length === 0) break;
     allAddresses.push(...pageAddrs);
-    await sleep(2500); // batas gratis GeckoTerminal ~30 panggilan/menit
+    await sleep(2500);
   }
   return allAddresses;
 }
@@ -225,7 +249,7 @@ async function resolvePoolToTokenAddress(pairAddress) {
   }
 }
 
-// ==================== GABUNGKAN KEDUA SUMBER (jarang, hemat compute unit Birdeye) ====================
+// ==================== GABUNGKAN KEDUA SUMBER ====================
 async function refreshWatchlist() {
   console.log(`\n[${new Date().toISOString()}] Refresh watchlist (Birdeye + GeckoTerminal)...`);
 
@@ -345,13 +369,22 @@ async function processOneToken(addr) {
   const entry = state.prices[addr] || { maxPrice: 0 };
   if (data.price > entry.maxPrice) entry.maxPrice = data.price;
 
+  // Rekam histori harga singkat untuk hitung momentum saat sinyal terkirim
+  entry.recentPrices = entry.recentPrices || [];
+  entry.recentPrices.push({ price: data.price, t: Date.now() });
+  if (entry.recentPrices.length > MOMENTUM_WINDOW) {
+    entry.recentPrices = entry.recentPrices.slice(-MOMENTUM_WINDOW);
+  }
+
   const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
   const sudahTurun = data.price <= PRICE_LOW;
 
   if (sudahMelambung && sudahTurun) {
-    console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price}`);
-    await sendTelegramAlert(data);
+    const momentum = computeMomentum(entry.recentPrices);
+    console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price} — momentum: ${momentum.label}`);
+    await sendTelegramAlert({ ...data, momentum });
     entry.maxPrice = data.price;
+    entry.recentPrices = []; // mulai segar untuk siklus/sinyal berikutnya
   }
 
   state.prices[addr] = entry;
