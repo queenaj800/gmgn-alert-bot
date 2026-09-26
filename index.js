@@ -11,6 +11,14 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 const PRICE_HIGH = parseFloat(process.env.PRICE_HIGH || '0.0001');
 const PRICE_LOW = parseFloat(process.env.PRICE_LOW || '0.00005');
 
+// Kriteria KEDUA (opsional): untuk pump yang lebih moderat, minta bukti dump yang JAUH
+// lebih dalam sebelum dianggap sinyal valid. Kalau harga ternyata terus naik sampai
+// menyentuh PRICE_HIGH (kriteria 1), otomatis "naik kelas" dan ikut aturan kriteria 1
+// (dump ke PRICE_LOW yang lebih dangkal), karena kriteria 1 dianggap lebih kuat/prioritas.
+// Kosongkan PRICE_HIGH_2 untuk menonaktifkan (cuma pakai 1 kriteria seperti sebelumnya).
+const PRICE_HIGH_2 = process.env.PRICE_HIGH_2 ? parseFloat(process.env.PRICE_HIGH_2) : null;
+const PRICE_LOW_2 = process.env.PRICE_LOW_2 ? parseFloat(process.env.PRICE_LOW_2) : null;
+
 const LIQUIDITY_MIN_USD = parseFloat(process.env.LIQUIDITY_MIN_USD || '10000');
 const MIN_LIQUIDITY_FOR_SIGNAL_USD = parseFloat(process.env.MIN_LIQUIDITY_FOR_SIGNAL_USD || '2000');
 const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000');
@@ -59,7 +67,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-26-v21 (discovery Birdeye & GeckoTerminal berjalan terpisah)');
+console.log('gmgn-alert-bot — versi 2026-09-26-v22 (dua tingkat kriteria pump/dump, kriteria 1 prioritas)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -126,7 +134,7 @@ function computeMomentum(recentPrices) {
 }
 
 // ==================== TELEGRAM ====================
-async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum }) {
+async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum, tierLabel }) {
   const mcText = marketCap != null ? `$${Number(marketCap).toLocaleString('en-US')}` : 'Data tidak tersedia';
   const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
   const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
@@ -135,8 +143,9 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
     ? `\nMomentum: ${momentum.label} (${momentum.pct.toFixed(1)}% dalam ${momentum.seconds}d terakhir)`
     : `\nMomentum: data belum cukup`;
 
+  const tierLine = tierLabel ? ` (kriteria ${tierLabel})` : '';
   const text =
-    `🚨 <b>Sinyal Ditemukan</b>\n\n` +
+    `🚨 <b>Sinyal Ditemukan</b>${tierLine}\n\n` +
     `Koin: <b>${escapeHtml(symbol)}</b> (${escapeHtml(name)})\n` +
     `CA: <code>${address}</code>\n` +
     `Harga sekarang: $${price}\n` +
@@ -403,19 +412,32 @@ async function processOneToken(addr) {
     entry.recentPrices = entry.recentPrices.slice(-MOMENTUM_WINDOW);
   }
 
-  const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
-  const sudahTurun = snapshot.price <= PRICE_LOW;
+  // Kriteria 1 diprioritaskan kalau tersentuh; kalau tidak, coba kriteria 2 (kalau aktif)
+  const sudahMelambungTier1 = entry.maxPrice >= PRICE_HIGH;
+  const sudahMelambungTier2 = PRICE_HIGH_2 != null && entry.maxPrice >= PRICE_HIGH_2;
 
-  if (sudahMelambung && sudahTurun) {
+  let dumpThreshold = null;
+  let tierLabel = null;
+  if (sudahMelambungTier1) {
+    dumpThreshold = PRICE_LOW;
+    tierLabel = '1';
+  } else if (sudahMelambungTier2) {
+    dumpThreshold = PRICE_LOW_2;
+    tierLabel = '2';
+  }
+
+  const sudahTurun = dumpThreshold != null && snapshot.price <= dumpThreshold;
+
+  if (dumpThreshold != null && sudahTurun) {
     const quality = await checkQualityGates(snapshot);
     if (quality.pass) {
       const momentum = computeMomentum(entry.recentPrices);
-      console.log(`🚨 Sinyal: ${snapshot.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${snapshot.price} — momentum: ${momentum.label}`);
-      await sendTelegramAlert({ ...quality.alertData, momentum });
+      console.log(`🚨 Sinyal (kriteria ${tierLabel}): ${snapshot.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${snapshot.price} — momentum: ${momentum.label}`);
+      await sendTelegramAlert({ ...quality.alertData, momentum, tierLabel });
       entry.maxPrice = snapshot.price;
       entry.recentPrices = [];
     } else {
-      console.log(`Sinyal tertunda: ${snapshot.symbol} (${addr}) — ${quality.reason}`);
+      console.log(`Sinyal tertunda (kriteria ${tierLabel}): ${snapshot.symbol} (${addr}) — ${quality.reason}`);
     }
   }
 
