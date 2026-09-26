@@ -67,7 +67,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-26-v22 (dua tingkat kriteria pump/dump, kriteria 1 prioritas)');
+console.log('gmgn-alert-bot — versi 2026-09-26-v24 (cluster wallet cuma jadi keterangan, tidak memblokir sinyal)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -134,10 +134,11 @@ function computeMomentum(recentPrices) {
 }
 
 // ==================== TELEGRAM ====================
-async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum, tierLabel }) {
+async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum, tierLabel, clusterWarning }) {
   const mcText = marketCap != null ? `$${Number(marketCap).toLocaleString('en-US')}` : 'Data tidak tersedia';
   const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
   const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
+  const clusterLine = clusterWarning ? `\n⚠️ Hati-hati: terdeteksi cluster wallet (mirip pola diagram gelembung mencurigakan)` : '';
 
   const momentumLine = momentum && momentum.pct != null
     ? `\nMomentum: ${momentum.label} (${momentum.pct.toFixed(1)}% dalam ${momentum.seconds}d terakhir)`
@@ -152,6 +153,7 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
     `Volume 1 Jam: $${Number(volume1h).toLocaleString('en-US')}\n` +
     `Market Cap: ${mcText}` +
     riskLine +
+    clusterLine +
     momentumLine + `\n` +
     (pairUrl ? `Chart: ${pairUrl}` : '');
 
@@ -178,29 +180,41 @@ function isBrandImpersonation(symbol, name) {
 async function checkRugCheckSafety(address) {
   return throttledRugCheck(async () => {
     try {
-      const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report/summary`;
+      const url = `https://api.rugcheck.xyz/v1/tokens/${address}/report`;
       const res = await fetch(url, { headers: { accept: 'application/json' } });
-      if (!res.ok) return { safe: true, reason: 'RugCheck tidak tersedia untuk token ini (dilewati)' };
+      if (!res.ok) return { safe: true, reason: 'RugCheck tidak tersedia untuk token ini (dilewati)', clusterWarning: false };
       const json = await res.json();
 
+      // Deteksi cluster/insider wallet (fungsi mirip diagram gelembung GMGN) — MASIH
+      // TAHAP PENGUMPULAN DATA. Sengaja HANYA jadi keterangan di notifikasi, TIDAK
+      // memblokir sinyal, sampai ada bukti data yang cukup untuk dijadikan filter keras.
+      let clusterWarning = false;
+      const risks = json?.risks || [];
+      const clusterKeywords = ['insider', 'cluster', 'bundle', 'bundled', 'sniper'];
+      if (json?.graphInsidersDetected) clusterWarning = true;
+      const clusterRisk = risks.find((r) => {
+        const t = `${r?.name || ''} ${r?.description || ''}`.toLowerCase();
+        return clusterKeywords.some((kw) => t.includes(kw));
+      });
+      if (clusterRisk) clusterWarning = true;
+
       if (json?.rugged === true) {
-        return { safe: false, reason: 'RugCheck: token sudah terdeteksi rugged' };
+        return { safe: false, reason: 'RugCheck: token sudah terdeteksi rugged', clusterWarning };
       }
       const riskScore = json?.score_normalised ?? null;
       if (riskScore != null && riskScore >= RUGCHECK_MAX_RISK_SCORE) {
-        return { safe: false, reason: `RugCheck: skor risiko ${riskScore}/100 (ambang ${RUGCHECK_MAX_RISK_SCORE})` };
+        return { safe: false, reason: `RugCheck: skor risiko ${riskScore}/100 (ambang ${RUGCHECK_MAX_RISK_SCORE})`, clusterWarning };
       }
-      const risks = json?.risks || [];
       const dangerousAuthority = risks.some((r) => {
         const t = `${r?.name || ''} ${r?.description || ''}`.toLowerCase();
         return (t.includes('mint authority') || t.includes('freeze authority')) && r?.level === 'danger';
       });
       if (dangerousAuthority) {
-        return { safe: false, reason: 'RugCheck: mint/freeze authority masih aktif' };
+        return { safe: false, reason: 'RugCheck: mint/freeze authority masih aktif', clusterWarning };
       }
-      return { safe: true, reason: null };
+      return { safe: true, reason: null, clusterWarning };
     } catch (err) {
-      return { safe: true, reason: `RugCheck error (dilewati): ${err.message}` };
+      return { safe: true, reason: `RugCheck error (dilewati): ${err.message}`, clusterWarning: false };
     }
   });
 }
@@ -370,6 +384,7 @@ async function checkQualityGates(snapshot) {
   if (cached.rugcheckSafe === undefined) {
     const rc = await checkRugCheckSafety(address);
     state.prices[address].rugcheckSafe = rc.safe;
+    state.prices[address].clusterWarning = rc.clusterWarning || false;
     if (!rc.safe) return { pass: false, reason: `RugCheck: ${rc.reason}` };
   } else if (cached.rugcheckSafe === false) {
     return { pass: false, reason: 'RugCheck: sudah pernah ditandai tidak aman' };
@@ -388,7 +403,10 @@ async function checkQualityGates(snapshot) {
 
   return {
     pass: true,
-    alertData: { address, symbol, name, price: snapshot.price, volume1h, marketCap, liquidityUsd, pairUrl: p.url },
+    alertData: {
+      address, symbol, name, price: snapshot.price, volume1h, marketCap, liquidityUsd, pairUrl: p.url,
+      clusterWarning: state.prices[address].clusterWarning || false,
+    },
   };
 }
 
