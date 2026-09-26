@@ -38,7 +38,11 @@ const SCAM_KEYWORDS = [...DEFAULT_SCAM_KEYWORDS, ...EXTRA_SCAM_KEYWORDS];
 const MIN_TOKEN_AGE_MINUTES = parseFloat(process.env.MIN_TOKEN_AGE_MINUTES || '20');
 const MAX_TOKEN_AGE_MINUTES = parseFloat(process.env.MAX_TOKEN_AGE_MINUTES || '60');
 
-const DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
+// Dua interval discovery TERPISAH: Birdeye (mahal secara CU, jarang) vs GeckoTerminal
+// (gratis tanpa batas CU, bisa lebih sering) — supaya koin yang baru mulai ramai
+// terdeteksi lebih cepat tanpa membebani jatah gratis Birdeye.
+const BIRDEYE_DISCOVER_INTERVAL_MS = parseInt(process.env.DISCOVER_INTERVAL_MINUTES || '45', 10) * 60 * 1000;
+const GECKO_DISCOVER_INTERVAL_MS = parseInt(process.env.GECKO_DISCOVER_INTERVAL_MINUTES || '15', 10) * 60 * 1000;
 
 const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
   ? parseFloat(process.env.CHECK_INTERVAL_SECONDS) * 1000
@@ -55,8 +59,8 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-26-v20 (pelacakan harga dipisah dari filter kualitas, supaya momen dump tidak terlewat)');
-console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}.`);
+console.log('gmgn-alert-bot — versi 2026-09-26-v21 (discovery Birdeye & GeckoTerminal berjalan terpisah)');
+console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -67,9 +71,14 @@ if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
 function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    return { watchlist: raw.watchlist || [], prices: raw.prices || {} };
+    return {
+      watchlist: raw.watchlist || [],
+      prices: raw.prices || {},
+      birdeyeAddresses: raw.birdeyeAddresses || [],
+      geckoAddresses: raw.geckoAddresses || [],
+    };
   } catch {
-    return { watchlist: [], prices: {} };
+    return { watchlist: [], prices: {}, birdeyeAddresses: [], geckoAddresses: [] };
   }
 }
 function saveState(state) {
@@ -248,33 +257,9 @@ async function resolvePoolToTokenAddress(pairAddress) {
   }
 }
 
-// ==================== GABUNGKAN KEDUA SUMBER ====================
-async function refreshWatchlist() {
-  console.log(`\n[${new Date().toISOString()}] Refresh watchlist (Birdeye + GeckoTerminal)...`);
-
-  let birdeyeAddresses = [];
-  try {
-    birdeyeAddresses = await getBirdeyeCandidates();
-    console.log(`Birdeye (volume 24 jam): ${birdeyeAddresses.length} koin.`);
-  } catch (err) {
-    console.error('Gagal ambil daftar dari Birdeye:', err.message);
-  }
-
-  let geckoAddresses = [];
-  try {
-    const poolAddrs = await getGeckoTerminalTrendingPools();
-    for (const poolAddr of poolAddrs) {
-      const tokenAddr = await resolvePoolToTokenAddress(poolAddr);
-      if (tokenAddr) geckoAddresses.push(tokenAddr);
-      await sleep(150);
-    }
-    console.log(`GeckoTerminal (volume 1 jam): ${geckoAddresses.length} koin.`);
-  } catch (err) {
-    console.error('Gagal ambil trending dari GeckoTerminal (dilewati, lanjut pakai Birdeye saja):', err.message);
-  }
-
-  const addresses = Array.from(new Set([...birdeyeAddresses, ...geckoAddresses]));
-
+// ==================== GABUNGKAN WATCHLIST DARI KEDUA SUMBER ====================
+function rebuildWatchlist() {
+  const addresses = Array.from(new Set([...state.birdeyeAddresses, ...state.geckoAddresses]));
   const newPrices = {};
   for (const addr of addresses) {
     newPrices[addr] = state.prices[addr] || { maxPrice: 0 };
@@ -282,13 +267,39 @@ async function refreshWatchlist() {
   state.watchlist = addresses;
   state.prices = newPrices;
   saveState(state);
-  console.log(`Watchlist gabungan diperbarui: ${addresses.length} koin unik.`);
+  console.log(`Watchlist gabungan diperbarui: ${addresses.length} koin unik (Birdeye: ${state.birdeyeAddresses.length}, GeckoTerminal: ${state.geckoAddresses.length}).`);
 }
 
-// ==================== TAHAP 1: snapshot harga (gate STABIL saja — tidak fluktuatif) ====================
-// dexId, umur, dan nama brand tidak berubah-ubah antar siklus, jadi aman dipakai sebagai
-// syarat untuk "apakah token ini boleh dilacak harganya sama sekali". Ini SELALU dijalankan
-// tiap siklus untuk setiap token di watchlist, supaya pelacakan harga tidak pernah bolong.
+async function refreshBirdeyeWatchlist() {
+  console.log(`\n[${new Date().toISOString()}] Refresh watchlist dari Birdeye (volume 24 jam)...`);
+  try {
+    state.birdeyeAddresses = await getBirdeyeCandidates();
+    console.log(`Birdeye: ${state.birdeyeAddresses.length} koin.`);
+  } catch (err) {
+    console.error('Gagal ambil daftar dari Birdeye:', err.message);
+  }
+  rebuildWatchlist();
+}
+
+async function refreshGeckoWatchlist() {
+  console.log(`\n[${new Date().toISOString()}] Refresh watchlist dari GeckoTerminal (volume 1 jam)...`);
+  try {
+    const poolAddrs = await getGeckoTerminalTrendingPools();
+    const geckoAddresses = [];
+    for (const poolAddr of poolAddrs) {
+      const tokenAddr = await resolvePoolToTokenAddress(poolAddr);
+      if (tokenAddr) geckoAddresses.push(tokenAddr);
+      await sleep(150);
+    }
+    state.geckoAddresses = geckoAddresses;
+    console.log(`GeckoTerminal: ${geckoAddresses.length} koin.`);
+  } catch (err) {
+    console.error('Gagal ambil trending dari GeckoTerminal (dilewati):', err.message);
+  }
+  rebuildWatchlist();
+}
+
+// ==================== TAHAP 1: snapshot harga (gate STABIL saja) ====================
 async function getTokenSnapshot(address) {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
   const res = await fetch(url);
@@ -318,10 +329,6 @@ async function getTokenSnapshot(address) {
 }
 
 // ==================== TAHAP 2: filter kualitas (gate FLUKTUATIF — dicek cuma saat sinyal) ====================
-// Likuiditas, market cap, volume, dan rata-rata ukuran transaksi bisa berubah liar sesaat
-// (apalagi pas harga sedang crash keras). Kalau ini dijadikan syarat tiap siklus seperti
-// sebelumnya, momen PRICE_LOW tersentuh bisa "terlewat" gara-gara salah satu angka ini
-// kebetulan gagal sesaat. Sekarang HANYA dicek sekali, tepat saat kondisi pump→dump terjadi.
 async function checkQualityGates(snapshot) {
   const { address, symbol, name, pair: p } = snapshot;
 
@@ -387,7 +394,6 @@ async function processOneToken(addr) {
   }
   if (!snapshot) return;
 
-  // Pelacakan harga SELALU jalan, terlepas dari filter kualitas di bawah
   const entry = state.prices[addr] || { maxPrice: 0 };
   if (snapshot.price > entry.maxPrice) entry.maxPrice = snapshot.price;
 
@@ -409,8 +415,6 @@ async function processOneToken(addr) {
       entry.maxPrice = snapshot.price;
       entry.recentPrices = [];
     } else {
-      // Gagal filter kualitas sesaat — JANGAN reset maxPrice, biar tetap "armed"
-      // dan dicoba lagi siklus berikutnya tanpa perlu pump ulang dari awal.
       console.log(`Sinyal tertunda: ${snapshot.symbol} (${addr}) — ${quality.reason}`);
     }
   }
@@ -455,8 +459,10 @@ http.createServer((req, res) => res.end('Bot aktif ✅')).listen(PORT, () => {
 
 // ==================== JALANKAN ====================
 (async () => {
-  await refreshWatchlist();
+  await refreshBirdeyeWatchlist();
+  await refreshGeckoWatchlist();
   await checkPricesOnce();
-  setInterval(refreshWatchlist, DISCOVER_INTERVAL_MS);
+  setInterval(refreshBirdeyeWatchlist, BIRDEYE_DISCOVER_INTERVAL_MS);
+  setInterval(refreshGeckoWatchlist, GECKO_DISCOVER_INTERVAL_MS);
   setInterval(checkPricesOnce, CHECK_INTERVAL_MS);
 })();
