@@ -17,14 +17,9 @@ const MIN_MARKET_CAP_USD = parseFloat(process.env.MIN_MARKET_CAP_USD || '10000')
 const MIN_VOLUME_1H_USD = parseFloat(process.env.MIN_VOLUME_1H_USD || '1000');
 const RUGCHECK_MAX_RISK_SCORE = parseFloat(process.env.RUGCHECK_MAX_RISK_SCORE || '50');
 
-// Holder count dari Birdeye terbukti tidak akurat dari kasus nyata (SNDK vs OG) —
-// kemungkinan menghitung alamat historis, bukan holder aktif. Dimatikan secara default.
 const MIN_HOLDER_COUNT = parseInt(process.env.MIN_HOLDER_COUNT || '600', 10);
 const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'false') === 'true';
 
-// Gate baru: rata-rata ukuran transaksi (volume 1 jam / jumlah transaksi 1 jam).
-// Kecil sekali = ciri wash trading (banyak transaksi kecil dari banyak wallet untuk
-// menciptakan kesan aktivitas yang sebenarnya palsu) — persis pola yang diamati di OG.
 const MIN_AVG_TRADE_SIZE_USD = parseFloat(process.env.MIN_AVG_TRADE_SIZE_USD || '15');
 
 const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || '')
@@ -60,8 +55,8 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-25-v19 (gate holder dimatikan default, gate anti wash-trading ditambah)');
-console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}. Cek holder: ${ENABLE_HOLDER_CHECK}. Min rata-rata transaksi: $${MIN_AVG_TRADE_SIZE_USD}.`);
+console.log('gmgn-alert-bot — versi 2026-09-26-v20 (pelacakan harga dipisah dari filter kualitas, supaya momen dump tidak terlewat)');
+console.log(`Interval cek harga: ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik. Batch size: ${BATCH_SIZE}.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
   console.error('❌ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, dan BIRDEYE_API_KEY wajib diisi di environment variables (lihat .env.example).');
@@ -161,7 +156,7 @@ function isBrandImpersonation(symbol, name) {
   return SCAM_KEYWORDS.some((kw) => text.includes(kw));
 }
 
-// ==================== RUGCHECK: skor risiko + status mint/freeze authority ====================
+// ==================== RUGCHECK ====================
 async function checkRugCheckSafety(address) {
   return throttledRugCheck(async () => {
     try {
@@ -192,7 +187,7 @@ async function checkRugCheckSafety(address) {
   });
 }
 
-// ==================== BIRDEYE: jumlah holder (opsional, dimatikan default) ====================
+// ==================== BIRDEYE: jumlah holder (opsional) ====================
 async function getHolderCount(address) {
   return throttledBirdeye(async () => {
     try {
@@ -290,8 +285,11 @@ async function refreshWatchlist() {
   console.log(`Watchlist gabungan diperbarui: ${addresses.length} koin unik.`);
 }
 
-// ==================== DEXSCREENER: harga, volume, marketcap, likuiditas + semua gate ====================
-async function getTokenMarketData(address) {
+// ==================== TAHAP 1: snapshot harga (gate STABIL saja — tidak fluktuatif) ====================
+// dexId, umur, dan nama brand tidak berubah-ubah antar siklus, jadi aman dipakai sebagai
+// syarat untuk "apakah token ini boleh dilacak harganya sama sekali". Ini SELALU dijalankan
+// tiap siklus untuk setiap token di watchlist, supaya pelacakan harga tidak pernah bolong.
+async function getTokenSnapshot(address) {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
   const res = await fetch(url);
   if (!res.ok) return null;
@@ -316,23 +314,38 @@ async function getTokenMarketData(address) {
   const name = p.baseToken?.name || '?';
   if (isBrandImpersonation(symbol, name)) return null;
 
+  return { address, symbol, name, price: priceNum, pair: p };
+}
+
+// ==================== TAHAP 2: filter kualitas (gate FLUKTUATIF — dicek cuma saat sinyal) ====================
+// Likuiditas, market cap, volume, dan rata-rata ukuran transaksi bisa berubah liar sesaat
+// (apalagi pas harga sedang crash keras). Kalau ini dijadikan syarat tiap siklus seperti
+// sebelumnya, momen PRICE_LOW tersentuh bisa "terlewat" gara-gara salah satu angka ini
+// kebetulan gagal sesaat. Sekarang HANYA dicek sekali, tepat saat kondisi pump→dump terjadi.
+async function checkQualityGates(snapshot) {
+  const { address, symbol, name, pair: p } = snapshot;
+
   const liquidityUsd = p.liquidity?.usd ?? null;
-  if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) return null;
+  if (liquidityUsd == null || liquidityUsd < MIN_LIQUIDITY_FOR_SIGNAL_USD) {
+    return { pass: false, reason: `likuiditas $${liquidityUsd ?? 0} (min $${MIN_LIQUIDITY_FOR_SIGNAL_USD})` };
+  }
 
   const marketCap = p.marketCap ?? p.fdv ?? null;
-  if (MIN_MARKET_CAP_USD > 0 && (marketCap == null || marketCap < MIN_MARKET_CAP_USD)) return null;
+  if (MIN_MARKET_CAP_USD > 0 && (marketCap == null || marketCap < MIN_MARKET_CAP_USD)) {
+    return { pass: false, reason: `market cap ${marketCap ?? 'tidak ada'} (min $${MIN_MARKET_CAP_USD})` };
+  }
 
   const volume1h = p.volume?.h1 || 0;
-  if (volume1h < MIN_VOLUME_1H_USD) return null;
+  if (volume1h < MIN_VOLUME_1H_USD) {
+    return { pass: false, reason: `volume 1h $${volume1h} (min $${MIN_VOLUME_1H_USD})` };
+  }
 
-  // Gate anti wash-trading: rata-rata ukuran transaksi terlalu kecil = mencurigakan
   const txnsH1 = p.txns?.h1;
   const txnCount = txnsH1 ? (txnsH1.buys || 0) + (txnsH1.sells || 0) : 0;
-  if (txnCount === 0) return null; // volume ada tapi transaksi 0 = data tidak konsisten
+  if (txnCount === 0) return { pass: false, reason: 'volume ada tapi transaksi 0 (data tidak konsisten)' };
   const avgTradeSize = volume1h / txnCount;
   if (avgTradeSize < MIN_AVG_TRADE_SIZE_USD) {
-    console.log(`Ditolak (wash trading?): ${symbol} (${address}) — rata-rata transaksi $${avgTradeSize.toFixed(2)} dari ${txnCount}x (min $${MIN_AVG_TRADE_SIZE_USD})`);
-    return null;
+    return { pass: false, reason: `rata-rata transaksi $${avgTradeSize.toFixed(2)} dari ${txnCount}x (min $${MIN_AVG_TRADE_SIZE_USD})` };
   }
 
   const cached = state.prices[address] || {};
@@ -341,63 +354,65 @@ async function getTokenMarketData(address) {
   if (cached.rugcheckSafe === undefined) {
     const rc = await checkRugCheckSafety(address);
     state.prices[address].rugcheckSafe = rc.safe;
-    if (!rc.safe) {
-      console.log(`Ditolak (RugCheck): ${symbol} (${address}) — ${rc.reason}`);
-      return null;
-    }
+    if (!rc.safe) return { pass: false, reason: `RugCheck: ${rc.reason}` };
   } else if (cached.rugcheckSafe === false) {
-    return null;
+    return { pass: false, reason: 'RugCheck: sudah pernah ditandai tidak aman' };
   }
 
   if (ENABLE_HOLDER_CHECK) {
     if (cached.holderCount === undefined) {
       const holderCount = await getHolderCount(address);
-      if (holderCount == null) {
-        console.log(`Ditolak (holder tidak terbaca): ${symbol} (${address}) — belum terindeks Birdeye, dicoba lagi siklus berikutnya.`);
-        return null;
-      }
+      if (holderCount == null) return { pass: false, reason: 'holder tidak terbaca dari Birdeye' };
       state.prices[address].holderCount = holderCount;
-      if (holderCount < MIN_HOLDER_COUNT) {
-        console.log(`Ditolak (holder): ${symbol} (${address}) — ${holderCount} holder (min ${MIN_HOLDER_COUNT})`);
-        return null;
-      }
+      if (holderCount < MIN_HOLDER_COUNT) return { pass: false, reason: `${holderCount} holder (min ${MIN_HOLDER_COUNT})` };
     } else if (cached.holderCount != null && cached.holderCount < MIN_HOLDER_COUNT) {
-      return null;
+      return { pass: false, reason: `${cached.holderCount} holder (min ${MIN_HOLDER_COUNT})` };
     }
   }
 
-  return { address, symbol, name, price: priceNum, volume1h, marketCap, liquidityUsd, pairUrl: p.url };
+  return {
+    pass: true,
+    alertData: { address, symbol, name, price: snapshot.price, volume1h, marketCap, liquidityUsd, pairUrl: p.url },
+  };
 }
 
 // ==================== SIKLUS CEK HARGA (paralel per batch) ====================
 async function processOneToken(addr) {
-  let data;
+  let snapshot;
   try {
-    data = await getTokenMarketData(addr);
+    snapshot = await getTokenSnapshot(addr);
   } catch (err) {
     console.error(`Gagal ambil data ${addr}:`, err.message);
     return;
   }
-  if (!data) return;
+  if (!snapshot) return;
 
+  // Pelacakan harga SELALU jalan, terlepas dari filter kualitas di bawah
   const entry = state.prices[addr] || { maxPrice: 0 };
-  if (data.price > entry.maxPrice) entry.maxPrice = data.price;
+  if (snapshot.price > entry.maxPrice) entry.maxPrice = snapshot.price;
 
   entry.recentPrices = entry.recentPrices || [];
-  entry.recentPrices.push({ price: data.price, t: Date.now() });
+  entry.recentPrices.push({ price: snapshot.price, t: Date.now() });
   if (entry.recentPrices.length > MOMENTUM_WINDOW) {
     entry.recentPrices = entry.recentPrices.slice(-MOMENTUM_WINDOW);
   }
 
   const sudahMelambung = entry.maxPrice >= PRICE_HIGH;
-  const sudahTurun = data.price <= PRICE_LOW;
+  const sudahTurun = snapshot.price <= PRICE_LOW;
 
   if (sudahMelambung && sudahTurun) {
-    const momentum = computeMomentum(entry.recentPrices);
-    console.log(`🚨 Sinyal: ${data.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${data.price} — momentum: ${momentum.label}`);
-    await sendTelegramAlert({ ...data, momentum });
-    entry.maxPrice = data.price;
-    entry.recentPrices = [];
+    const quality = await checkQualityGates(snapshot);
+    if (quality.pass) {
+      const momentum = computeMomentum(entry.recentPrices);
+      console.log(`🚨 Sinyal: ${snapshot.symbol} (${addr}) — puncak $${entry.maxPrice} → sekarang $${snapshot.price} — momentum: ${momentum.label}`);
+      await sendTelegramAlert({ ...quality.alertData, momentum });
+      entry.maxPrice = snapshot.price;
+      entry.recentPrices = [];
+    } else {
+      // Gagal filter kualitas sesaat — JANGAN reset maxPrice, biar tetap "armed"
+      // dan dicoba lagi siklus berikutnya tanpa perlu pump ulang dari awal.
+      console.log(`Sinyal tertunda: ${snapshot.symbol} (${addr}) — ${quality.reason}`);
+    }
   }
 
   state.prices[addr] = entry;
