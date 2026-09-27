@@ -30,6 +30,12 @@ const ENABLE_HOLDER_CHECK = (process.env.ENABLE_HOLDER_CHECK ?? 'false') === 'tr
 
 const MIN_AVG_TRADE_SIZE_USD = parseFloat(process.env.MIN_AVG_TRADE_SIZE_USD || '15');
 
+// Bundle buys % dari Solana Tracker (API terpisah, perlu daftar akun sendiri, gratis
+// 2.500 request/bulan). Kalau SOLANATRACKER_API_KEY kosong, cek ini otomatis dilewati
+// (tidak mengganggu apa pun) — cuma jadi KETERANGAN tambahan, tidak memblokir sinyal.
+const SOLANATRACKER_API_KEY = process.env.SOLANATRACKER_API_KEY || '';
+const BUNDLE_WARNING_PCT = parseFloat(process.env.BUNDLE_WARNING_PCT || '65');
+
 const EXCLUDE_DEX_IDS = (process.env.EXCLUDE_DEX_IDS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
@@ -67,7 +73,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-27-v27 (retry otomatis kalau GeckoTerminal kena rate limit 429)');
+console.log('gmgn-alert-bot — versi 2026-09-27-v28 (keterangan bundle buys via Solana Tracker, opsional)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -134,11 +140,12 @@ function computeMomentum(recentPrices) {
 }
 
 // ==================== TELEGRAM ====================
-async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum, tierLabel, clusterWarning }) {
+async function sendTelegramAlert({ symbol, name, address, price, volume1h, marketCap, liquidityUsd, pairUrl, momentum, tierLabel, clusterWarning, bundleWarning, bundlePercentage }) {
   const mcText = marketCap != null ? `$${Number(marketCap).toLocaleString('en-US')}` : 'Data tidak tersedia';
   const risky = liquidityUsd == null || liquidityUsd < LIQUIDITY_MIN_USD;
   const riskLine = risky ? `\n⚠️ RISIKO LIKUIDITAS TINGGI` : '';
   const clusterLine = clusterWarning ? `\n⚠️ Hati-hati: terdeteksi cluster wallet (mirip pola diagram gelembung mencurigakan)` : '';
+  const bundleLine = bundleWarning ? `\n⚠️ Hati-hati: Bundle buys tinggi (${bundlePercentage.toFixed(1)}%)` : '';
 
   const momentumLine = momentum && momentum.pct != null
     ? `\nMomentum: ${momentum.label} (${momentum.pct.toFixed(1)}% dalam ${momentum.seconds}d terakhir)`
@@ -154,6 +161,7 @@ async function sendTelegramAlert({ symbol, name, address, price, volume1h, marke
     `Market Cap: ${mcText}` +
     riskLine +
     clusterLine +
+    bundleLine +
     momentumLine + `\n` +
     (pairUrl ? `Chart: ${pairUrl}` : '');
 
@@ -234,6 +242,20 @@ async function getHolderCount(address) {
       return null;
     }
   });
+}
+
+// ==================== SOLANA TRACKER: persentase bundle buys ====================
+async function getBundlePercentage(address) {
+  if (!SOLANATRACKER_API_KEY) return null;
+  try {
+    const url = `https://data.solanatracker.io/tokens/${address}`;
+    const res = await fetch(url, { headers: { 'x-api-key': SOLANATRACKER_API_KEY } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.risk?.bundlers?.totalPercentage ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // ==================== SUMBER DISCOVERY 1: BIRDEYE ====================
@@ -415,11 +437,19 @@ async function checkQualityGates(snapshot) {
     }
   }
 
+  // Bundle buys % — HANYA keterangan, tidak memblokir. Di-cache per token.
+  if (state.prices[address].bundlePercentage === undefined) {
+    state.prices[address].bundlePercentage = await getBundlePercentage(address);
+  }
+  const bundlePercentage = state.prices[address].bundlePercentage;
+  const bundleWarning = bundlePercentage != null && bundlePercentage > BUNDLE_WARNING_PCT;
+
   return {
     pass: true,
     alertData: {
       address, symbol, name, price: snapshot.price, volume1h, marketCap, liquidityUsd, pairUrl: p.url,
       clusterWarning: state.prices[address].clusterWarning || false,
+      bundleWarning, bundlePercentage,
     },
   };
 }
