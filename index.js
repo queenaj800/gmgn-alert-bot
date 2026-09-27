@@ -67,7 +67,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-26-v24 (cluster wallet cuma jadi keterangan, tidak memblokir sinyal)');
+console.log('gmgn-alert-bot — versi 2026-09-27-v26 (kriteria 2 dimatikan permanen setelah token pernah capai level kriteria 1)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -424,15 +424,36 @@ async function processOneToken(addr) {
   const entry = state.prices[addr] || { maxPrice: 0 };
   if (snapshot.price > entry.maxPrice) entry.maxPrice = snapshot.price;
 
+  // Penanda PERMANEN (tidak pernah direset oleh sinyal manapun) — apakah token ini
+  // PERNAH mencapai level kriteria 1 sepanjang riwayatnya. Sekali pernah, kriteria 2
+  // dimatikan SELAMANYA untuk token ini — supaya pantulan lemah sisa tenaga habis
+  // pasca-pump besar (misal setelah kriteria 1 sudah terkirim) tidak dianggap sinyal
+  // kriteria 2 yang baru. Kriteria 2 murni cuma untuk token yang BELUM PERNAH sama
+  // sekali menyentuh level kriteria 1.
+  entry.allTimeMaxPrice = Math.max(entry.allTimeMaxPrice || 0, snapshot.price);
+  const pernahCapaiTier1 = entry.allTimeMaxPrice >= PRICE_HIGH;
+
+  // Tandai kalau harga pernah "singgah" di zona kriteria 2 (antara PRICE_HIGH_2 dan
+  // PRICE_HIGH) sebelum menembus PRICE_HIGH. Kalau harga melompat LANGSUNG dari bawah
+  // PRICE_HIGH_2 ke atas PRICE_HIGH tanpa pernah tersampel di zona ini, itu indikasi
+  // pump instan/bundled (bukan kenaikan bertahap) — kriteria 1 tidak akan diaktifkan.
+  if (PRICE_HIGH_2 != null && snapshot.price >= PRICE_HIGH_2 && snapshot.price < PRICE_HIGH) {
+    entry.touchedTier2Zone = true;
+  }
+
   entry.recentPrices = entry.recentPrices || [];
   entry.recentPrices.push({ price: snapshot.price, t: Date.now() });
   if (entry.recentPrices.length > MOMENTUM_WINDOW) {
     entry.recentPrices = entry.recentPrices.slice(-MOMENTUM_WINDOW);
   }
 
-  // Kriteria 1 diprioritaskan kalau tersentuh; kalau tidak, coba kriteria 2 (kalau aktif)
-  const sudahMelambungTier1 = entry.maxPrice >= PRICE_HIGH;
-  const sudahMelambungTier2 = PRICE_HIGH_2 != null && entry.maxPrice >= PRICE_HIGH_2;
+  // Kalau PRICE_HIGH_2 tidak diset, syarat "singgah dulu" tidak berlaku (perilaku lama).
+  const passedThroughTier2Zone = PRICE_HIGH_2 == null || entry.touchedTier2Zone === true;
+
+  // Kriteria 1 diprioritaskan kalau tersentuh SECARA BERTAHAP; kriteria 2 HANYA berlaku
+  // kalau token ini belum pernah sama sekali menyentuh level kriteria 1 sepanjang riwayatnya.
+  const sudahMelambungTier1 = entry.maxPrice >= PRICE_HIGH && passedThroughTier2Zone;
+  const sudahMelambungTier2 = PRICE_HIGH_2 != null && entry.maxPrice >= PRICE_HIGH_2 && !pernahCapaiTier1;
 
   let dumpThreshold = null;
   let tierLabel = null;
@@ -454,6 +475,7 @@ async function processOneToken(addr) {
       await sendTelegramAlert({ ...quality.alertData, momentum, tierLabel });
       entry.maxPrice = snapshot.price;
       entry.recentPrices = [];
+      entry.touchedTier2Zone = false;
     } else {
       console.log(`Sinyal tertunda (kriteria ${tierLabel}): ${snapshot.symbol} (${addr}) — ${quality.reason}`);
     }
