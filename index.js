@@ -67,7 +67,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-27-v26 (kriteria 2 dimatikan permanen setelah token pernah capai level kriteria 1)');
+console.log('gmgn-alert-bot — versi 2026-09-27-v27 (retry otomatis kalau GeckoTerminal kena rate limit 429)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -250,19 +250,33 @@ async function getBirdeyeCandidates() {
 }
 
 // ==================== SUMBER DISCOVERY 2: GECKOTERMINAL ====================
+async function fetchGeckoPage(page) {
+  const url = `https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=1h&page=${page}`;
+  const res = await fetch(url, { headers: { accept: 'application/json' } });
+  if (res.status === 429) return { retry: true };
+  if (!res.ok) return { retry: false, addrs: null, status: res.status };
+  const json = await res.json();
+  const addrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
+  return { retry: false, addrs };
+}
+
 async function getGeckoTerminalTrendingPools() {
   const allAddresses = [];
   for (let page = 1; page <= GECKO_PAGES; page++) {
-    const url = `https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=1h&page=${page}`;
-    const res = await fetch(url, { headers: { accept: 'application/json' } });
-    if (!res.ok) {
-      console.error(`GeckoTerminal halaman ${page} gagal (${res.status}), lanjut dengan yang sudah ada.`);
+    let result = await fetchGeckoPage(page);
+    if (result.retry) {
+      // Kena rate limit (kemungkinan IP Railway dipakai bersama pengguna lain) —
+      // tunggu lebih lama lalu coba sekali lagi sebelum menyerah untuk siklus ini.
+      console.error(`GeckoTerminal halaman ${page} kena rate limit (429), tunggu 8 detik lalu coba ulang sekali...`);
+      await sleep(8000);
+      result = await fetchGeckoPage(page);
+    }
+    if (result.retry || result.addrs == null) {
+      console.error(`GeckoTerminal halaman ${page} gagal (${result.status || 429}), lanjut dengan yang sudah ada.`);
       break;
     }
-    const json = await res.json();
-    const pageAddrs = (json?.data || []).map((p) => p.attributes?.address).filter(Boolean);
-    if (pageAddrs.length === 0) break;
-    allAddresses.push(...pageAddrs);
+    if (result.addrs.length === 0) break;
+    allAddresses.push(...result.addrs);
     await sleep(2500);
   }
   return allAddresses;
