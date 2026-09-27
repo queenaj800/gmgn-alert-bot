@@ -86,7 +86,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-27-v30 (jalur super cepat untuk koin armed berbundle tinggi)');
+console.log('gmgn-alert-bot — versi 2026-09-27-v31 (bundle check dicoba ulang kalau gagal, tidak permanen gagal)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -259,14 +259,27 @@ async function getHolderCount(address) {
 
 // ==================== SOLANA TRACKER: persentase bundle buys ====================
 async function getBundlePercentage(address) {
-  if (!SOLANATRACKER_API_KEY) return null;
+  if (!SOLANATRACKER_API_KEY) {
+    console.log(`Bundle check dilewati (${address}): SOLANATRACKER_API_KEY belum diisi.`);
+    return null;
+  }
   try {
     const url = `https://data.solanatracker.io/tokens/${address}`;
     const res = await fetch(url, { headers: { 'x-api-key': SOLANATRACKER_API_KEY } });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log(`Bundle check gagal (${address}): HTTP ${res.status}.`);
+      return null;
+    }
     const json = await res.json();
-    return json?.risk?.bundlers?.totalPercentage ?? null;
-  } catch {
+    const pct = json?.risk?.bundlers?.totalPercentage ?? null;
+    if (pct == null) {
+      console.log(`Bundle check (${address}): field bundlers.totalPercentage tidak ditemukan di respons Solana Tracker.`);
+    } else {
+      console.log(`Bundle check (${address}): ${pct}%.`);
+    }
+    return pct;
+  } catch (err) {
+    console.log(`Bundle check error (${address}): ${err.message}`);
     return null;
   }
 }
@@ -452,8 +465,10 @@ async function checkQualityGates(snapshot) {
 
   // Bundle buys % — biasanya sudah dicek sejak token armed (lihat processOneTokenInner),
   // tapi jaga-jaga kalau belum (misal dump terjadi di siklus armed pertama), cek di sini juga.
+  // Sama seperti di atas: kalau gagal, TIDAK disimpan permanen sebagai null.
   if (state.prices[address].bundlePercentage === undefined) {
-    state.prices[address].bundlePercentage = await getBundlePercentage(address);
+    const pct = await getBundlePercentage(address);
+    if (pct != null) state.prices[address].bundlePercentage = pct;
   }
   const bundlePercentage = state.prices[address].bundlePercentage;
   const bundleWarning = bundlePercentage != null && bundlePercentage > BUNDLE_WARNING_PCT;
@@ -490,6 +505,9 @@ async function processOneTokenInner(addr) {
   if (!snapshot) return;
 
   const entry = state.prices[addr] || { maxPrice: 0 };
+  state.prices[addr] = entry; // tulis balik SEGERA — supaya referensi konsisten dipakai
+                               // fungsi lain (mis. checkQualityGates) di siklus yang sama,
+                               // menghindari data bundle/rugcheck "tidak terlihat" sesaat
   if (snapshot.price > entry.maxPrice) entry.maxPrice = snapshot.price;
 
   // Penanda PERMANEN (tidak pernah direset oleh sinyal manapun) — apakah token ini
@@ -525,8 +543,11 @@ async function processOneTokenInner(addr) {
 
   // Begitu armed (kriteria mana pun), langsung cek bundle % kalau belum pernah — supaya
   // token berisiko tinggi bisa segera masuk jalur super cepat, bukan nunggu momen dump.
+  // PENTING: cuma disimpan kalau BERHASIL dapat angka — kalau gagal (network/API error),
+  // TIDAK disimpan sebagai null permanen, supaya dicoba lagi di siklus berikutnya.
   if ((sudahMelambungTier1 || sudahMelambungTier2) && entry.bundlePercentage === undefined) {
-    entry.bundlePercentage = await getBundlePercentage(addr);
+    const pct = await getBundlePercentage(addr);
+    if (pct != null) entry.bundlePercentage = pct;
   }
 
   let dumpThreshold = null;
