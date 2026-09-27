@@ -64,6 +64,19 @@ const CHECK_INTERVAL_MS = process.env.CHECK_INTERVAL_SECONDS
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '5', 10);
 
+// Jalur cepat KHUSUS untuk koin yang sudah "armed" (pernah tembus PRICE_HIGH/PRICE_HIGH_2,
+// tinggal tunggu dump). Dicek jauh lebih sering daripada siklus umum, karena koin volatil
+// bisa jatuh puluhan persen dalam hitungan detik — polling umum (20 detik) terlalu lambat
+// untuk menangkap momen persis itu. Jumlah koin "armed" biasanya sedikit, jadi aman dicek
+// sesering ini tanpa membebani API.
+const FAST_CHECK_INTERVAL_MS = parseInt(process.env.FAST_CHECK_INTERVAL_SECONDS || '5', 10) * 1000;
+
+// Jalur SUPER CEPAT khusus koin armed yang bundle buys-nya sudah terbukti tinggi —
+// hipotesis: bundle tinggi = wallet terkoordinasi, lebih rawan dump instan/serentak,
+// jadi diberi prioritas pengecekan tercepat. Bundle % sekarang dicek SEJAK koin armed
+// (bukan nunggu sampai mau dump), supaya prioritas ini bisa langsung berlaku.
+const HIGH_RISK_FAST_CHECK_INTERVAL_MS = parseInt(process.env.HIGH_RISK_FAST_CHECK_INTERVAL_SECONDS || '2', 10) * 1000;
+
 const MOMENTUM_WINDOW = parseInt(process.env.MOMENTUM_WINDOW || '5', 10);
 const MOMENTUM_FLAT_THRESHOLD_PCT = parseFloat(process.env.MOMENTUM_FLAT_THRESHOLD_PCT || '3');
 
@@ -73,7 +86,7 @@ const GECKO_PAGES = parseInt(process.env.GECKO_PAGES || '3', 10);
 const STATE_DIR = process.env.STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
-console.log('gmgn-alert-bot — versi 2026-09-27-v28 (keterangan bundle buys via Solana Tracker, opsional)');
+console.log('gmgn-alert-bot — versi 2026-09-27-v30 (jalur super cepat untuk koin armed berbundle tinggi)');
 console.log(`Discovery Birdeye: tiap ${(BIRDEYE_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Discovery GeckoTerminal: tiap ${(GECKO_DISCOVER_INTERVAL_MS / 60000).toFixed(0)} menit. Cek harga: tiap ${(CHECK_INTERVAL_MS / 1000).toFixed(0)} detik.`);
 
 if (!BOT_TOKEN || !CHAT_ID || !BIRDEYE_API_KEY) {
@@ -437,7 +450,8 @@ async function checkQualityGates(snapshot) {
     }
   }
 
-  // Bundle buys % — HANYA keterangan, tidak memblokir. Di-cache per token.
+  // Bundle buys % — biasanya sudah dicek sejak token armed (lihat processOneTokenInner),
+  // tapi jaga-jaga kalau belum (misal dump terjadi di siklus armed pertama), cek di sini juga.
   if (state.prices[address].bundlePercentage === undefined) {
     state.prices[address].bundlePercentage = await getBundlePercentage(address);
   }
@@ -455,7 +469,17 @@ async function checkQualityGates(snapshot) {
 }
 
 // ==================== SIKLUS CEK HARGA (paralel per batch) ====================
+const inFlight = new Set(); // cegah token yang sama diproses 2 loop (umum & cepat) bersamaan
 async function processOneToken(addr) {
+  if (inFlight.has(addr)) return;
+  inFlight.add(addr);
+  try {
+    await processOneTokenInner(addr);
+  } finally {
+    inFlight.delete(addr);
+  }
+}
+async function processOneTokenInner(addr) {
   let snapshot;
   try {
     snapshot = await getTokenSnapshot(addr);
@@ -499,6 +523,12 @@ async function processOneToken(addr) {
   const sudahMelambungTier1 = entry.maxPrice >= PRICE_HIGH && passedThroughTier2Zone;
   const sudahMelambungTier2 = PRICE_HIGH_2 != null && entry.maxPrice >= PRICE_HIGH_2 && !pernahCapaiTier1;
 
+  // Begitu armed (kriteria mana pun), langsung cek bundle % kalau belum pernah — supaya
+  // token berisiko tinggi bisa segera masuk jalur super cepat, bukan nunggu momen dump.
+  if ((sudahMelambungTier1 || sudahMelambungTier2) && entry.bundlePercentage === undefined) {
+    entry.bundlePercentage = await getBundlePercentage(addr);
+  }
+
   let dumpThreshold = null;
   let tierLabel = null;
   if (sudahMelambungTier1) {
@@ -526,6 +556,54 @@ async function processOneToken(addr) {
   }
 
   state.prices[addr] = entry;
+}
+
+// Cari token yang sudah "armed" (tinggal tunggu dump) — cek murni dari data di memori,
+// tanpa panggilan API, jadi ringan dipanggil tiap beberapa detik.
+function getArmedAddresses() {
+  return state.watchlist.filter((addr) => {
+    const entry = state.prices[addr];
+    if (!entry) return false;
+    const pernahCapaiTier1 = (entry.allTimeMaxPrice || 0) >= PRICE_HIGH;
+    const armedTier1 = entry.maxPrice >= PRICE_HIGH;
+    const armedTier2 = PRICE_HIGH_2 != null && entry.maxPrice >= PRICE_HIGH_2 && !pernahCapaiTier1;
+    return armedTier1 || armedTier2;
+  });
+}
+
+function getHighRiskArmedAddresses(armedAddresses) {
+  return armedAddresses.filter((addr) => {
+    const pct = state.prices[addr]?.bundlePercentage;
+    return pct != null && pct > BUNDLE_WARNING_PCT;
+  });
+}
+
+let isFastChecking = false;
+async function fastCheckArmedTokens() {
+  if (isFastChecking) return;
+  const armed = getArmedAddresses();
+  if (armed.length === 0) return;
+  isFastChecking = true;
+  try {
+    await Promise.all(armed.map((addr) => processOneToken(addr)));
+    saveState(state);
+  } finally {
+    isFastChecking = false;
+  }
+}
+
+let isHighRiskChecking = false;
+async function highRiskCheckArmedTokens() {
+  if (isHighRiskChecking) return;
+  const highRisk = getHighRiskArmedAddresses(getArmedAddresses());
+  if (highRisk.length === 0) return;
+  isHighRiskChecking = true;
+  try {
+    await Promise.all(highRisk.map((addr) => processOneToken(addr)));
+    saveState(state);
+  } finally {
+    isHighRiskChecking = false;
+  }
 }
 
 let isChecking = false;
@@ -571,4 +649,6 @@ http.createServer((req, res) => res.end('Bot aktif ✅')).listen(PORT, () => {
   setInterval(refreshBirdeyeWatchlist, BIRDEYE_DISCOVER_INTERVAL_MS);
   setInterval(refreshGeckoWatchlist, GECKO_DISCOVER_INTERVAL_MS);
   setInterval(checkPricesOnce, CHECK_INTERVAL_MS);
+  setInterval(fastCheckArmedTokens, FAST_CHECK_INTERVAL_MS);
+  setInterval(highRiskCheckArmedTokens, HIGH_RISK_FAST_CHECK_INTERVAL_MS);
 })();
